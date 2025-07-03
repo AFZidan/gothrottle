@@ -116,7 +116,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.22
+        go-version: '1.22'
         cache: false
 
     - name: Verify Go installation
@@ -158,7 +158,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.22
+        go-version: '1.22'
         cache: false
 
     - name: Verify Go installation
@@ -200,7 +200,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.22
+        go-version: '1.22'
         cache: false
 
     - name: Verify Go installation
