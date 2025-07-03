@@ -135,6 +135,7 @@ func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRu
 	}
 
 	canRun = canRunInt == 1
+	waitTime = 0 // Default to no wait
 	if waitTimeInt > 0 {
 		waitTime = time.Duration(waitTimeInt) * time.Millisecond
 	}

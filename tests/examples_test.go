@@ -21,7 +21,7 @@ func ExampleLimiter_local() {
 	if err != nil {
 		panic(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	// Schedule some jobs
 	for i := 0; i < 5; i++ {
@@ -62,7 +62,7 @@ func ExampleLimiter_redis() {
 	if err != nil {
 		panic(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	// Schedule jobs that will be rate limited across multiple instances
 	for i := 0; i < 3; i++ {
@@ -88,7 +88,7 @@ func TestLimiter_Wrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	// Create a wrapped function
 	wrappedFn := limiter.Wrap(func() (interface{}, error) {

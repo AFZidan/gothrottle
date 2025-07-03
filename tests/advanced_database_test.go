@@ -30,7 +30,7 @@ func NewWeightedDatabaseThrottler(db *sql.DB, opts gothrottle.Options) (*Weighte
 }
 
 func (dt *WeightedDatabaseThrottler) Close() {
-	dt.limiter.Stop()
+	_ = dt.limiter.Stop() // Ignore error in test cleanup
 }
 
 // TestWeightedDatabaseOperations demonstrates different weights for different database operations
@@ -71,7 +71,7 @@ func BenchmarkThrottledDatabaseOperations(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer throttler.Stop()
+	defer func() { _ = throttler.Stop() }() // Ignore error in test cleanup
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {

@@ -69,7 +69,7 @@ func (dt *DatabaseThrottler) Exec(query string, args ...interface{}) (sql.Result
 
 // Close closes the database connection and stops the limiter
 func (dt *DatabaseThrottler) Close() error {
-	dt.limiter.Stop()
+	_ = dt.limiter.Stop() // Ignore limiter stop error in cleanup
 	return dt.db.Close()
 }
 

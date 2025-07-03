@@ -17,7 +17,7 @@ func TestLimiter_MaxConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	// Track concurrent executions
 	var concurrent int32
@@ -67,7 +67,7 @@ func TestLimiter_MinTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	start := time.Now()
 	var times []time.Time
@@ -105,7 +105,7 @@ func TestLimiter_Priority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	var results []string
 	var mu sync.Mutex
@@ -150,7 +150,7 @@ func TestLimiter_Weight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	// Schedule a heavy job (weight 3) - should use all capacity
 	var executed bool
@@ -225,7 +225,7 @@ func TestLocalStore_Basic(t *testing.T) {
 	}
 
 	// Second request should succeed (within concurrent limit)
-	canRun, waitTime, err = store.Request("test", 1, opts)
+	canRun, _, err = store.Request("test", 1, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestLocalStore_Basic(t *testing.T) {
 	}
 
 	// Third request should fail (exceeds concurrent limit)
-	canRun, waitTime, err = store.Request("test", 1, opts)
+	canRun, _, err = store.Request("test", 1, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ func TestLocalStore_Basic(t *testing.T) {
 	}
 
 	// Now third request should succeed
-	canRun, waitTime, err = store.Request("test", 1, opts)
+	canRun, _, err = store.Request("test", 1, opts)
 	if err != nil {
 		t.Fatal(err)
 	}

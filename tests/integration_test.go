@@ -21,7 +21,7 @@ func TestIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	// Track execution order and timing
 	var results []string
@@ -104,7 +104,7 @@ func TestWrappedFunction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	// Original function
 	originalFunc := func() (interface{}, error) {
@@ -144,7 +144,7 @@ func BenchmarkLimiter(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer limiter.Stop()
+	defer func() { _ = limiter.Stop() }() // Ignore error in test cleanup
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
