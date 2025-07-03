@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: [1.19, 1.20, 1.21, 1.22]
+        go-version: ['1.19', '1.20', '1.21', '1.22']
         redis-version: [6, 7]
 
     services:
@@ -30,11 +30,40 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Remove old Go
+      run: |
+        sudo rm -rf /usr/local/go
+        sudo rm -rf /opt/hostedtoolcache/go/1.2.2
+
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v4
       with:
         go-version: ${{ matrix.go-version }}
         cache: false
+
+    - name: Verify Go installation
+      run: |
+        echo "Expected Go version: ${{ matrix.go-version }}"
+        echo "Actual Go version: $(go version)"
+        echo "Go root: ${GOROOT:-not set}"
+        echo "Go path: ${GOPATH:-not set}"
+        echo "Which go: $(which go)"
+        echo "PATH: $PATH"
+        
+        # Verify we have go modules support
+        if ! go help mod >/dev/null 2>&1; then
+          echo "ERROR: Go modules not supported in this Go version"
+          go help
+          exit 1
+        fi
+        echo "✓ Go modules supported"
+        
+        # Verify minimum Go version for modules
+        GO_VERSION=$(go version | cut -d' ' -f3 | cut -d'.' -f1-2 | sed 's/go//')
+        if [ "$(printf '%s\n' "1.11" "$GO_VERSION" | sort -V | head -n1)" != "1.11" ]; then
+          echo "ERROR: Go version $GO_VERSION is too old for modules (requires >= 1.11)"
+          exit 1
+        fi
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -85,10 +114,22 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v4
       with:
-        go-version: 1.22
+        go-version: '1.22
         cache: false
+
+    - name: Verify Go installation
+      run: |
+        echo "Expected Go version: 1.22"
+        echo "Go version: $(go version)"
+        # Ensure correct Go is in PATH
+        if [ -d "/opt/hostedtoolcache/go/1.22" ]; then
+          export GOROOT="/opt/hostedtoolcache/go/1.22/x64"
+          export PATH="$GOROOT/bin:$PATH"
+          echo "GOROOT=$GOROOT" >> $GITHUB_ENV
+          echo "$GOROOT/bin" >> $GITHUB_PATH
+        fi
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -115,10 +156,22 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v4
       with:
-        go-version: 1.22
+        go-version: '1.22
         cache: false
+
+    - name: Verify Go installation
+      run: |
+        echo "Expected Go version: 1.22"
+        echo "Go version: $(go version)"
+        # Ensure correct Go is in PATH
+        if [ -d "/opt/hostedtoolcache/go/1.22" ]; then
+          export GOROOT="/opt/hostedtoolcache/go/1.22/x64"
+          export PATH="$GOROOT/bin:$PATH"
+          echo "GOROOT=$GOROOT" >> $GITHUB_ENV
+          echo "$GOROOT/bin" >> $GITHUB_PATH
+        fi
 
     - name: Cache Go modules
       uses: actions/cache@v4
@@ -145,10 +198,22 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v4
       with:
-        go-version: 1.22
+        go-version: '1.22
         cache: false
+
+    - name: Verify Go installation
+      run: |
+        echo "Expected Go version: 1.22"
+        echo "Go version: $(go version)"
+        # Ensure correct Go is in PATH
+        if [ -d "/opt/hostedtoolcache/go/1.22" ]; then
+          export GOROOT="/opt/hostedtoolcache/go/1.22/x64"
+          export PATH="$GOROOT/bin:$PATH"
+          echo "GOROOT=$GOROOT" >> $GITHUB_ENV
+          echo "$GOROOT/bin" >> $GITHUB_PATH
+        fi
 
     - name: Cache Go modules
       uses: actions/cache@v4
