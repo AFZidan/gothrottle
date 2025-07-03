@@ -206,7 +206,105 @@ gothrottle/
 
 See `tests/examples_test.go` for more detailed examples of usage patterns.
 
-## Running Tests
+## Development
+
+GoThrottle includes a comprehensive Makefile that provides all the common development commands. The Makefile offers a consistent and easy way to build, test, lint, and manage the project.
+
+### Getting Started
+
+```bash
+# Show all available commands
+make help
+
+# Install development tools (golangci-lint, gosec)
+make install-tools
+
+# Quick development workflow (format, vet, test)
+make dev
+```
+
+### Common Commands
+
+```bash
+# Build and Test
+make build                 # Build the project
+make test                  # Run tests
+make test-race            # Run tests with race detector
+make test-cover           # Run tests with coverage
+make test-bench           # Run benchmarks
+make test-all             # Run all tests (race, coverage, benchmarks)
+
+# Code Quality
+make fmt                  # Format code
+make fmt-check           # Check if code is formatted
+make vet                 # Run go vet
+make lint                # Run golangci-lint
+make security            # Run gosec security scan
+make quality             # Run all quality checks
+
+# Coverage
+make coverage-html       # Generate HTML coverage report
+make coverage-check      # Check coverage meets minimum threshold (60%)
+
+# Dependencies
+make deps                # Download dependencies
+make verify              # Verify dependencies
+make mod-tidy            # Tidy up go.mod and go.sum
+make mod-update          # Update dependencies to latest versions
+
+# Cross-platform builds
+make cross-build         # Build for multiple platforms (Linux, macOS, Windows)
+
+# CI Simulation
+make ci                  # Simulate full CI pipeline locally
+make release-check       # Full release readiness check
+```
+
+### Quick Development Workflows
+
+```bash
+# Quick test cycle during development
+make quick-test          # Format → Vet → Test
+
+# Quick build cycle
+make quick-build         # Format → Vet → Build
+
+# Full quality gate (before committing)
+make quality             # Format check → Vet → Lint → Security scan
+
+# Full CI simulation (before pushing)
+make ci                  # Dependencies → Quality → All tests → Cross-build
+```
+
+### Coverage Requirements
+
+The project maintains a minimum code coverage of **60%**. You can check if your changes meet this requirement:
+
+```bash
+make coverage-check
+```
+
+This will run the tests with coverage and verify that the total coverage meets the minimum threshold.
+
+### Docker Testing
+
+For testing with Redis in an isolated environment:
+
+```bash
+make docker-test         # Run tests in Docker with Redis
+```
+
+### Watch Mode
+
+For continuous testing during development (requires `entr`):
+
+```bash
+make watch-test          # Automatically run tests when files change
+```
+
+### Manual Testing Commands
+
+If you prefer to run commands manually without the Makefile:
 
 ```bash
 # Run all tests
@@ -214,6 +312,9 @@ go test ./tests/... -v
 
 # Run benchmarks
 go test ./tests/... -bench=. -benchmem
+
+# Test with coverage
+go test -v -race -coverprofile=coverage.out -coverpkg=./... ./tests/...
 
 # Test a specific function
 go test ./tests/... -run TestLimiter_MaxConcurrent -v

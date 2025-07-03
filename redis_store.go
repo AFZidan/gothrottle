@@ -3,7 +3,7 @@ package gothrottle
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 - SHA1 is used for Redis script hashing, not cryptographic security
 	"fmt"
 	"time"
 
@@ -76,7 +76,7 @@ return {1, 0}
 
 // loadScript loads the Lua script into Redis and stores its SHA.
 func (rs *RedisStore) loadScript() error {
-	sha := fmt.Sprintf("%x", sha1.Sum([]byte(redisScript)))
+	sha := fmt.Sprintf("%x", sha1.Sum([]byte(redisScript))) // #nosec G401 - SHA1 is used for Redis script hashing, not cryptographic security
 
 	// Check if script already exists
 	exists, err := rs.client.ScriptExists(rs.ctx, sha).Result()
