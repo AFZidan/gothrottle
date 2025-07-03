@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0D1117;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#161B22;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0D1117;stop-opacity:1" />
+    </linearGradient>
+    
+    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00ADD8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0066CC;stop-opacity:1" />
+    </linearGradient>
+    
+    <linearGradient id="accentGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF6B35;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#CC4400;stop-opacity:1" />
+    </linearGradient>
+    
+    <!-- Pattern for background -->
+    <pattern id="gridPattern" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#21262D" stroke-width="1" opacity="0.3"/>
+    </pattern>
+    
+    <!-- Arrow marker -->
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" 
+     refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#00ADD8" />
+    </marker>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#bgGradient)"/>
+  <rect width="1280" height="640" fill="url(#gridPattern)" opacity="0.5"/>
+  
+  <!-- Main container -->
+  <g transform="translate(640, 320)">
+    
+    <!-- Logo (scaled up version) -->
+    <g transform="translate(-400, -50) scale(0.8)">
+      <!-- Background circle -->
+      <circle cx="100" cy="100" r="95" fill="url(#logoGradient)" stroke="#FFFFFF" stroke-width="3"/>
+      
+      <!-- Throttle valve body -->
+      <rect x="60" y="85" width="80" height="30" rx="15" fill="#FFFFFF" opacity="0.9"/>
+      
+      <!-- Throttle butterfly valve -->
+      <ellipse cx="100" cy="100" rx="25" ry="8" fill="url(#accentGradient)" transform="rotate(25 100 100)"/>
+      
+      <!-- Throttle shaft -->
+      <line x1="75" y1="100" x2="125" y2="100" stroke="#333333" stroke-width="3" stroke-linecap="round"/>
+      
+      <!-- Flow indicators (left side - many requests) -->
+      <g opacity="0.8">
+        <line x1="20" y1="80" x2="50" y2="80" stroke="#00ADD8" stroke-width="2" marker-end="url(#arrowhead)"/>
+        <line x1="20" y1="90" x2="50" y2="90" stroke="#00ADD8" stroke-width="2" marker-end="url(#arrowhead)"/>
+        <line x1="20" y1="100" x2="50" y2="100" stroke="#00ADD8" stroke-width="2" marker-end="url(#arrowhead)"/>
+        <line x1="20" y1="110" x2="50" y2="110" stroke="#00ADD8" stroke-width="2" marker-end="url(#arrowhead)"/>
+        <line x1="20" y1="120" x2="50" y2="120" stroke="#00ADD8" stroke-width="2" marker-end="url(#arrowhead)"/>
+      </g>
+      
+      <!-- Flow indicators (right side - throttled) -->
+      <g opacity="0.8">
+        <line x1="150" y1="95" x2="180" y2="95" stroke="#00ADD8" stroke-width="4" marker-end="url(#arrowhead)"/>
+        <line x1="150" y1="105" x2="180" y2="105" stroke="#00ADD8" stroke-width="4" marker-end="url(#arrowhead)"/>
+      </g>
+      
+      <!-- Gear teeth around the circle -->
+      <g fill="#FFFFFF" opacity="0.6">
+        <!-- Distributed around the circle -->
+        <rect x="95" y="5" width="10" height="15" rx="2"/>
+        <rect x="115" y="10" width="8" height="12" rx="2" transform="rotate(30 119 16)"/>
+        <rect x="130" y="25" width="8" height="12" rx="2" transform="rotate(60 134 31)"/>
+        <rect x="185" y="95" width="15" height="10" rx="2"/>
+        <rect x="180" y="115" width="12" height="8" rx="2" transform="rotate(30 186 119)"/>
+        <rect x="165" y="130" width="12" height="8" rx="2" transform="rotate(60 171 134)"/>
+        <rect x="95" y="185" width="10" height="15" rx="2"/>
+        <rect x="75" y="180" width="8" height="12" rx="2" transform="rotate(-30 79 186)"/>
+        <rect x="60" y="165" width="8" height="12" rx="2" transform="rotate(-60 64 171)"/>
+        <rect x="5" y="95" width="15" height="10" rx="2"/>
+        <rect x="10" y="75" width="12" height="8" rx="2" transform="rotate(-30 16 79)"/>
+        <rect x="25" y="60" width="12" height="8" rx="2" transform="rotate(-60 31 64)"/>
+      </g>
+      
+      <!-- Central hub -->
+      <circle cx="100" cy="100" r="12" fill="#333333"/>
+      <circle cx="100" cy="100" r="6" fill="#FFFFFF"/>
+    </g>
+    
+    <!-- Main Title -->
+    <text x="100" y="-20" font-family="Arial, sans-serif" font-size="72" font-weight="bold" fill="#FFFFFF" text-anchor="middle">
+      GoThrottle
+    </text>
+    
+    <!-- Subtitle -->
+    <text x="100" y="30" font-family="Arial, sans-serif" font-size="24" fill="#8B949E" text-anchor="middle">
+      Go Rate Limiting &amp; Request Throttling Library
+    </text>
+    
+    <!-- Feature badges on the right -->
+    <g transform="translate(200, -60)">
+      <!-- Local & Distributed badge -->
+      <rect x="0" y="0" width="200" height="35" rx="17" fill="#21262D" stroke="#30363D" stroke-width="1"/>
+      <text x="100" y="24" font-family="Arial, sans-serif" font-size="16" fill="#58A6FF" text-anchor="middle">
+        ⚡ Local &amp; Distributed
+      </text>
+      
+      <!-- Redis Support badge -->
+      <rect x="0" y="45" width="200" height="35" rx="17" fill="#21262D" stroke="#30363D" stroke-width="1"/>
+      <text x="100" y="69" font-family="Arial, sans-serif" font-size="16" fill="#7C3AED" text-anchor="middle">
+        🔗 Redis Support
+      </text>
+      
+      <!-- Priority Queue badge -->
+      <rect x="0" y="90" width="200" height="35" rx="17" fill="#21262D" stroke="#30363D" stroke-width="1"/>
+      <text x="100" y="114" font-family="Arial, sans-serif" font-size="16" fill="#F85149" text-anchor="middle">
+        📊 Priority Queue
+      </text>
+    </g>
+    
+    <!-- Go badge -->
+    <g transform="translate(-300, 100)">
+      <rect x="0" y="0" width="120" height="40" rx="20" fill="url(#logoGradient)"/>
+      <text x="60" y="28" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF" text-anchor="middle">
+        Go 1.19+
+      </text>
+    </g>
+    
+    <!-- MIT License badge -->
+    <g transform="translate(-150, 100)">
+      <rect x="0" y="0" width="100" height="40" rx="20" fill="#28A745"/>
+      <text x="50" y="28" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#FFFFFF" text-anchor="middle">
+        MIT
+      </text>
+    </g>
+    
+    <!-- GitHub link -->
+    <text x="100" y="170" font-family="Arial, sans-serif" font-size="18" fill="#58A6FF" text-anchor="middle">
+      github.com/AFZidan/gothrottle
+    </text>
+    
+    <!-- Code snippet background -->
+    <g transform="translate(-280, -200)">
+      <rect x="0" y="0" width="560" height="120" rx="8" fill="#0D1117" stroke="#21262D" stroke-width="2" opacity="0.8"/>
+      
+      <!-- Code text -->
+      <text x="20" y="30" font-family="Monaco, Consolas, monospace" font-size="14" fill="#7DD3FC">
+        limiter, err := gothrottle.NewLimiter(gothrottle.Options{
+      </text>
+      <text x="40" y="50" font-family="Monaco, Consolas, monospace" font-size="14" fill="#A78BFA">
+        MaxConcurrent: 5,
+      </text>
+      <text x="40" y="70" font-family="Monaco, Consolas, monospace" font-size="14" fill="#A78BFA">
+        MinTime: 100 * time.Millisecond,
+      </text>
+      <text x="20" y="90" font-family="Monaco, Consolas, monospace" font-size="14" fill="#7DD3FC">
+        })
+      </text>
+    </g>
+    
+  </g>
+  
+  <!-- Decorative elements -->
+  <!-- Top left corner -->
+  <circle cx="100" cy="100" r="3" fill="#00ADD8" opacity="0.6"/>
+  <circle cx="150" cy="80" r="2" fill="#FF6B35" opacity="0.4"/>
+  <circle cx="200" cy="120" r="2" fill="#7C3AED" opacity="0.5"/>
+  
+  <!-- Bottom right corner -->
+  <circle cx="1180" cy="540" r="3" fill="#00ADD8" opacity="0.6"/>
+  <circle cx="1130" cy="560" r="2" fill="#FF6B35" opacity="0.4"/>
+  <circle cx="1080" cy="520" r="2" fill="#7C3AED" opacity="0.5"/>
+  
+  <!-- Connecting lines (subtle) -->
+  <line x1="100" y1="100" x2="200" y2="120" stroke="#30363D" stroke-width="1" opacity="0.3"/>
+  <line x1="1080" y1="520" x2="1180" y2="540" stroke="#30363D" stroke-width="1" opacity="0.3"/>
+</svg>

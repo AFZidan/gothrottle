@@ -1,13 +1,21 @@
 # GoThrottle
 
-[![Go Version](https://img.shields.io/github/go-mod/go-version/AFZidan/gothrottle)](https://golang.org/)
-[![Build Status](https://github.com/AFZidan/gothrottle/workflows/CI/CD%20Pipeline/badge.svg)](https://github.com/AFZidan/gothrottle/actions)
-[![Go Report Card](https://goreportcard.com/badge/github.com/AFZidan/gothrottle)](https://goreportcard.com/report/github.com/AFZidan/gothrottle)
-[![Coverage Status](https://coveralls.io/repos/github/AFZidan/gothrottle/badge.svg?branch=main)](https://coveralls.io/github/AFZidan/gothrottle?branch=main)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GoDoc](https://godoc.org/github.com/AFZidan/gothrottle?status.svg)](https://godoc.org/github.com/AFZidan/gothrottle)
+<p align="center">
+  <img src="assets/logo-256.png" alt="GoThrottle Logo" width="200"/>
+</p>
 
-A Go package for request throttling and rate limiting, heavily inspired by the Node.js [bottleneck](https://www.npmjs.com/package/bottleneck) package.
+<p align="center">
+  <a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/AFZidan/gothrottle" alt="Go Version"></a>
+  <a href="https://github.com/AFZidan/gothrottle/actions"><img src="https://github.com/AFZidan/gothrottle/workflows/CI/CD%20Pipeline/badge.svg" alt="Build Status"></a>
+  <a href="https://goreportcard.com/report/github.com/AFZidan/gothrottle"><img src="https://goreportcard.com/badge/github.com/AFZidan/gothrottle" alt="Go Report Card"></a>
+  <a href="https://coveralls.io/github/AFZidan/gothrottle?branch=main"><img src="https://coveralls.io/repos/github/AFZidan/gothrottle/badge.svg?branch=main" alt="Coverage Status"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://godoc.org/github.com/AFZidan/gothrottle"><img src="https://godoc.org/github.com/AFZidan/gothrottle?status.svg" alt="GoDoc"></a>
+</p>
+
+<p align="center">
+  <strong>A Go package for request throttling and rate limiting, heavily inspired by the Node.js <a href="https://www.npmjs.com/package/bottleneck">bottleneck</a> package.</strong>
+</p>
 
 ## Features
 
@@ -177,6 +185,12 @@ gothrottle/
 ├── redis_store.go     # Redis-based storage implementation
 ├── limiter.go         # Main Limiter struct and logic
 ├── errors.go          # Common error definitions
+├── assets/            # Visual assets and branding
+│   ├── logo.svg                 # Vector logo
+│   ├── logo-*.png              # PNG logos (64px, 128px, 256px, 512px)
+│   ├── social-preview.svg       # Social media preview (vector)
+│   ├── social-preview-1280x640.png # GitHub social preview (PNG)
+│   └── README.md               # Asset documentation
 ├── tests/             # Test files
 │   ├── examples_test.go         # Basic usage examples
 │   ├── limiter_test.go          # Core limiter unit tests
@@ -193,8 +207,11 @@ gothrottle/
 │   │   ├── feature_request.md
 │   │   └── documentation.md
 │   └── pull_request_template.md
+├── Makefile           # Development commands and workflows
 ├── go.mod             # Go module definition
 ├── go.sum             # Go module checksums
+├── docker-compose.test.yml # Docker testing environment
+├── Dockerfile.test    # Docker test container
 ├── README.md          # This file
 ├── CONTRIBUTING.md    # Contribution guidelines
 ├── CHANGELOG.md       # Version history
