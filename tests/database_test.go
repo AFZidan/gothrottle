@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"gothrottle"
+	"github.com/AFZidan/gothrottle"
 
 	_ "github.com/mattn/go-sqlite3" // SQLite driver for example
 )

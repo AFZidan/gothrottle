@@ -1,5 +1,12 @@
 # GoThrottle
 
+[![Go Version](https://img.shields.io/github/go-mod/go-version/AFZidan/gothrottle)](https://golang.org/)
+[![Build Status](https://github.com/AFZidan/gothrottle/workflows/CI/CD%20Pipeline/badge.svg)](https://github.com/AFZidan/gothrottle/actions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/AFZidan/gothrottle)](https://goreportcard.com/report/github.com/AFZidan/gothrottle)
+[![Coverage Status](https://coveralls.io/repos/github/AFZidan/gothrottle/badge.svg?branch=main)](https://coveralls.io/github/AFZidan/gothrottle?branch=main)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GoDoc](https://godoc.org/github.com/AFZidan/gothrottle?status.svg)](https://godoc.org/github.com/AFZidan/gothrottle)
+
 A Go package for request throttling and rate limiting, heavily inspired by the Node.js [bottleneck](https://www.npmjs.com/package/bottleneck) package.
 
 ## Features
@@ -163,22 +170,36 @@ type Datastore interface {
 
 ```text
 gothrottle/
-├── datastore.go      # Datastore interface definition
-├── options.go        # Configuration options
-├── job.go           # Job struct and priority queue
-├── local_store.go   # In-memory storage implementation
-├── redis_store.go   # Redis-based storage implementation
-├── limiter.go       # Main Limiter struct and logic
-├── errors.go        # Common error definitions
-├── tests/           # Test files
-│   ├── examples_test.go            # Basic usage examples
-│   ├── limiter_test.go             # Core limiter unit tests
-│   ├── integration_test.go         # Integration tests and benchmarks
-│   ├── database_test.go            # Database throttling tests
-│   └── advanced_database_test.go   # Advanced DB operations with weights
-├── go.mod           # Go module definition
-├── go.sum           # Go module checksums
-└── README.md        # This file
+├── datastore.go         # Datastore interface definition
+├── options.go          # Configuration options
+├── job.go             # Job struct and priority queue
+├── local_store.go     # In-memory storage implementation
+├── redis_store.go     # Redis-based storage implementation
+├── limiter.go         # Main Limiter struct and logic
+├── errors.go          # Common error definitions
+├── tests/             # Test files
+│   ├── examples_test.go         # Basic usage examples
+│   ├── limiter_test.go          # Core limiter unit tests
+│   ├── integration_test.go      # Integration tests and benchmarks
+│   ├── database_test.go         # Database throttling tests
+│   └── advanced_database_test.go # Advanced DB operations with weights
+├── .github/           # GitHub workflows and templates
+│   ├── workflows/
+│   │   ├── ci.yml                # CI/CD pipeline
+│   │   ├── release.yml           # Release automation
+│   │   └── codeql.yml           # Security analysis
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.md
+│   │   ├── feature_request.md
+│   │   └── documentation.md
+│   └── pull_request_template.md
+├── go.mod             # Go module definition
+├── go.sum             # Go module checksums
+├── README.md          # This file
+├── CONTRIBUTING.md    # Contribution guidelines
+├── CHANGELOG.md       # Version history
+├── SECURITY.md        # Security policy
+└── LICENSE            # MIT License
 ```
 
 ## Examples

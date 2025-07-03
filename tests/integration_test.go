@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"gothrottle"
+	"github.com/AFZidan/gothrottle"
 )
 
 // TestIntegration demonstrates the full workflow

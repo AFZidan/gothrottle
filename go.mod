@@ -1,4 +1,4 @@
-module gothrottle
+module github.com/AFZidan/gothrottle
 
 go 1.19
 

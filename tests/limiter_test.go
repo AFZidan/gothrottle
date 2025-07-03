@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"gothrottle"
+	"github.com/AFZidan/gothrottle"
 )
 
 func TestLimiter_MaxConcurrent(t *testing.T) {

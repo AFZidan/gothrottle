@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"gothrottle"
+	"github.com/AFZidan/gothrottle"
 
 	"github.com/go-redis/redis/v8"
 )
