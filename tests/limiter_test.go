@@ -2,8 +2,10 @@
 package gothrottle_test
 
 import (
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -202,6 +204,214 @@ func TestLimiter_Stop(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("Expected error when scheduling on stopped limiter")
+	}
+}
+
+func TestLimiter_StopWaitsForRunningJob(t *testing.T) {
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	scheduleDone := make(chan error, 1)
+
+	go func() {
+		_, err := limiter.Schedule(func() (interface{}, error) {
+			close(started)
+			<-release
+			return "done", nil
+		})
+		scheduleDone <- err
+	}()
+
+	<-started
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- limiter.Stop()
+	}()
+
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop returned before running job completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-scheduleDone:
+		if err != nil {
+			t.Fatalf("running job returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("running job did not complete")
+	}
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not return after running job completed")
+	}
+}
+
+func TestLimiter_StopCancelsQueuedWork(t *testing.T) {
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{MaxConcurrent: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := limiter.Schedule(func() (interface{}, error) {
+			close(firstStarted)
+			<-releaseFirst
+			return nil, nil
+		})
+		firstDone <- err
+	}()
+	<-firstStarted
+
+	queuedDone := make(chan error, 1)
+	go func() {
+		_, err := limiter.Schedule(func() (interface{}, error) {
+			return nil, nil
+		})
+		queuedDone <- err
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- limiter.Stop()
+	}()
+
+	select {
+	case err := <-queuedDone:
+		if !errors.Is(err, gothrottle.ErrStoreClosed) {
+			t.Fatalf("queued job error = %v, want ErrStoreClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued job was not canceled")
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first job returned error: %v", err)
+	}
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+}
+
+func TestLimiter_ScheduleRejectsNilTask(t *testing.T) {
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = limiter.Stop() }()
+
+	_, err = limiter.Schedule(nil)
+	if !errors.Is(err, gothrottle.ErrNilTask) {
+		t.Fatalf("Schedule(nil) error = %v, want ErrNilTask", err)
+	}
+}
+
+func TestLimiter_ScheduleReturnsPanicError(t *testing.T) {
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = limiter.Stop() }()
+
+	_, err = limiter.Schedule(func() (interface{}, error) {
+		panic("boom")
+	})
+	if !errors.Is(err, gothrottle.ErrTaskPanic) {
+		t.Fatalf("panic task error = %v, want ErrTaskPanic", err)
+	}
+}
+
+func TestLimiter_ScheduleRejectsOverweightJob(t *testing.T) {
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{MaxConcurrent: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = limiter.Stop() }()
+
+	_, err = limiter.ScheduleWithOptions(func() (interface{}, error) {
+		return nil, nil
+	}, 1, 2)
+	if !errors.Is(err, gothrottle.ErrWeightExceedsMax) {
+		t.Fatalf("overweight job error = %v, want ErrWeightExceedsMax", err)
+	}
+}
+
+func TestLimiter_ConcurrentScheduleWithOptionsRace(t *testing.T) {
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{MaxConcurrent: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = limiter.Stop() }()
+
+	var executed int32
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(priority int) {
+			defer wg.Done()
+			_, err := limiter.ScheduleWithOptions(func() (interface{}, error) {
+				atomic.AddInt32(&executed, 1)
+				return nil, nil
+			}, priority, 1)
+			if err != nil {
+				t.Errorf("ScheduleWithOptions failed: %v", err)
+			}
+		}(i % 10)
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&executed); got != 100 {
+		t.Fatalf("executed jobs = %d, want 100", got)
+	}
+}
+
+func TestPublicAPICompatibility(t *testing.T) {
+	if _, err := gothrottle.NewLimiter(gothrottle.Options{
+		Datastore: gothrottle.NewLocalStore(),
+	}); !errors.Is(err, gothrottle.ErrMissingID) {
+		t.Fatalf("custom datastore without ID error = %v, want ErrMissingID", err)
+	}
+
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := limiter.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := limiter.Schedule(func() (interface{}, error) {
+		return nil, nil
+	}); !errors.Is(err, gothrottle.ErrStoreClosed) {
+		t.Fatalf("Schedule after Stop error = %v, want ErrStoreClosed", err)
+	}
+
+	pq := gothrottle.NewPriorityQueue()
+	pq.PushJob(&gothrottle.Job{Priority: 1})
+	pq.PushJob(&gothrottle.Job{Priority: 10})
+	if pq.IsEmpty() {
+		t.Fatal("priority queue should not be empty")
+	}
+	if job := pq.PopJob(); job == nil || job.Priority != 10 {
+		t.Fatalf("highest priority job = %#v, want priority 10", job)
 	}
 }
 

@@ -3,6 +3,8 @@ package gothrottle_test
 
 import (
 	"database/sql"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,20 +35,118 @@ func (dt *WeightedDatabaseThrottler) Close() {
 	_ = dt.limiter.Stop() // Ignore error in test cleanup
 }
 
+func (dt *WeightedDatabaseThrottler) ExecWithWeight(weight int, query string, args ...interface{}) (sql.Result, error) {
+	result, err := dt.limiter.ScheduleWithOptions(func() (interface{}, error) {
+		return dt.db.Exec(query, args...)
+	}, 5, weight)
+	if err != nil {
+		return nil, err
+	}
+	return result.(sql.Result), nil
+}
+
 // TestWeightedDatabaseOperations demonstrates different weights for different database operations
 func TestWeightedDatabaseOperations(t *testing.T) {
-	t.Skip("Skipping weighted database test - demonstrates patterns but has table creation timing issues")
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
 
-	// This test demonstrates weighted database operation patterns but is skipped due to
-	// test environment timing issues. In real applications, this pattern works well.
+	if _, err := db.Exec(`CREATE TABLE weighted_ops (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	throttler, err := NewWeightedDatabaseThrottler(db, gothrottle.Options{
+		MaxConcurrent: 3,
+		MinTime:       time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer throttler.Close()
+
+	if _, err := throttler.ExecWithWeight(3, "INSERT INTO weighted_ops (kind) VALUES (?)", "heavy"); err != nil {
+		t.Fatalf("heavy operation failed: %v", err)
+	}
+	if _, err := throttler.ExecWithWeight(1, "INSERT INTO weighted_ops (kind) VALUES (?)", "light"); err != nil {
+		t.Fatalf("light operation failed: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM weighted_ops").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("inserted rows = %d, want 2", count)
+	}
 }
 
 // TestBatchProcessingWithThrottling shows how to process large datasets with rate limiting
 func TestBatchProcessingWithThrottling(t *testing.T) {
-	t.Skip("Skipping batch processing test - demonstrates patterns but has test environment timing issues")
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
 
-	// This test demonstrates batch processing patterns but is skipped due to
-	// test environment timing issues. In real applications, this pattern works well.
+	if _, err := db.Exec(`CREATE TABLE batches (id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{
+		MaxConcurrent: 1,
+		MinTime:       time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = limiter.Stop() }()
+
+	for batchID := 0; batchID < 3; batchID++ {
+		batchID := batchID
+		_, err := limiter.Schedule(func() (interface{}, error) {
+			for item := 0; item < 5; item++ {
+				if _, err := db.Exec("INSERT INTO batches (batch_id, value) VALUES (?, ?)", batchID, "value"); err != nil {
+					return nil, err
+				}
+			}
+			return nil, nil
+		})
+		if err != nil {
+			t.Fatalf("batch %d failed: %v", batchID, err)
+		}
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM batches").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 15 {
+		t.Fatalf("processed rows = %d, want 15", count)
+	}
+}
+
+func TestLimiter_RejectsMalformedDatastoreIDs(t *testing.T) {
+	store := gothrottle.NewLocalStore()
+
+	_, err := gothrottle.NewLimiter(gothrottle.Options{
+		ID:        strings.Repeat("a", 513),
+		Datastore: store,
+	})
+	if !errors.Is(err, gothrottle.ErrInvalidID) {
+		t.Fatalf("oversized ID error = %v, want ErrInvalidID", err)
+	}
+
+	_, err = gothrottle.NewLimiter(gothrottle.Options{
+		ID:        "bad\nid",
+		Datastore: store,
+	})
+	if !errors.Is(err, gothrottle.ErrInvalidID) {
+		t.Fatalf("control-character ID error = %v, want ErrInvalidID", err)
+	}
 }
 
 // BenchmarkThrottledDatabaseOperations measures performance with throttling

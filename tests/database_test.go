@@ -3,6 +3,7 @@ package gothrottle_test
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -307,4 +308,25 @@ func TestDistributedDatabaseThrottling(t *testing.T) {
 	}
 
 	t.Logf("Successfully logged %d API calls with distributed throttling", count)
+}
+
+func TestLocalStore_InvalidWeights(t *testing.T) {
+	store := gothrottle.NewLocalStore()
+	opts := gothrottle.Options{MaxConcurrent: 2}
+
+	if _, _, err := store.Request("test", 0, opts); !errors.Is(err, gothrottle.ErrInvalidWeight) {
+		t.Fatalf("Request weight 0 error = %v, want ErrInvalidWeight", err)
+	}
+
+	if _, _, err := store.Request("test", -1, opts); !errors.Is(err, gothrottle.ErrInvalidWeight) {
+		t.Fatalf("Request negative weight error = %v, want ErrInvalidWeight", err)
+	}
+
+	if err := store.RegisterDone("test", 0); !errors.Is(err, gothrottle.ErrInvalidWeight) {
+		t.Fatalf("RegisterDone weight 0 error = %v, want ErrInvalidWeight", err)
+	}
+
+	if err := store.RegisterDone("test", -1); !errors.Is(err, gothrottle.ErrInvalidWeight) {
+		t.Fatalf("RegisterDone negative weight error = %v, want ErrInvalidWeight", err)
+	}
 }

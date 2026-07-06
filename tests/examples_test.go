@@ -2,6 +2,7 @@
 package gothrottle_test
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -102,5 +103,19 @@ func TestLimiter_Wrap(t *testing.T) {
 	}
 	if result != "wrapped result" {
 		t.Errorf("Expected 'wrapped result', got %v", result)
+	}
+}
+
+func TestLimiter_WrapRejectsNilFunction(t *testing.T) {
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = limiter.Stop() }()
+
+	wrappedFn := limiter.Wrap(nil)
+	_, err = wrappedFn()
+	if !errors.Is(err, gothrottle.ErrNilTask) {
+		t.Fatalf("wrapped nil function error = %v, want ErrNilTask", err)
 	}
 }
