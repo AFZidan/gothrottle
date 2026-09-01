@@ -45,3 +45,40 @@ REDIS_ADDR=localhost:6379 REQUIRE_REDIS=true go test -race ./tests/...
   this reason.
 - Timing decisions in Redis mode come from `TIME` inside Lua, never from
   `time.Now()` in the client. Durations cross the boundary as microseconds.
+
+## Redis invariants
+
+These are the rules the Lua scripts exist to enforce. Each one was a real defect
+before it was a rule, so changing a script means re-reading this list.
+
+- **Rate spacing is not lease state.** `MinTime` is measured from a job's start,
+  so `last-start` is written only on a successful admission and is never deleted
+  or refreshed by renewal, release or expired-lease reclamation. Its lifetime
+  derives from `MinTime` alone. Coupling the two let a crashed holder's expiry
+  grant the next job a free start, and let a 1s lease TTL shorten a 45s window.
+- **Reclamation touches reservations only** — the lease hash and the expiry
+  ZSET, never `last-start`.
+- **TTLs are extended, never shortened.** Every script goes through its
+  `ensure_ttl` helper. A release holding a short lease TTL must not cut short a
+  key protecting a long `MinTime`; that asymmetry is exactly what broke
+  `RegisterDone` on the legacy path.
+- **Running weight is summed from live leases**, not tracked in a counter, so a
+  late release cannot corrupt the total. It is bounded by `MaxConcurrent`.
+- **Renewal checks the expiry score, not just the hash field.** A lease whose
+  expiry has passed must not be revivable, because the capacity may already
+  belong to someone else.
+- **All four keys per limiter share one hash tag**, derived by hashing the ID —
+  never the raw ID, which could contain braces and choose its own tag. Keys come
+  from `newLimiterKeys` only.
+- **Collections stay bounded**, and expired tokens are reclaimed in batches so
+  `unpack()` cannot exceed Lua's argument limit.
+- **Configuration agreement is decided before any write**, so a rejected client
+  cannot disturb the leases, TTLs or spacing state it disagreed about.
+
+## Cancellation model
+
+The limiter owns a context cancelled by `Stop`, passed to `Acquire` and `Renew`
+so a blocking store cannot hold shutdown open. `Release` deliberately does not
+use it — capacity has to come back — and instead has its own
+`max(LeaseTTL, 5s)` budget across all retries. A shutdown-cancelled acquisition
+surfaces to the caller as `ErrStoreClosed`, not as a datastore error.

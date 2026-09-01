@@ -25,6 +25,8 @@
 - **Event-Driven Scheduler**: Dispatches as capacity frees up, with no idle polling
 - **Atomic Operations**: Redis operations use Lua scripts, with the clock read from Redis so instances need not agree on time
 - **Renewable Leases**: Capacity is held by tokenized leases, so a long job keeps its slot and a crashed process releases it
+- **Independent Rate Spacing**: `MinTime` is measured from a job's start and outlives the lease that started it, so a crash cannot grant the next job a free start
+- **Configuration Agreement**: Instances sharing a limiter ID must agree on the distributed limits, or the disagreement is reported rather than silently resolved
 - **Easy Integration**: Simple API for wrapping existing functions
 
 ## Installation
@@ -225,6 +227,32 @@ and repeatedly; every caller blocks until shutdown completes and receives the
 same error. Do not call `Stop` from inside a scheduled task: it waits for that
 task to finish.
 
+#### Cancellation
+
+Two contexts are in play, and they answer different questions.
+
+The context you pass to `ScheduleContext` bounds *your* wait. Cancel it while the
+job is queued and the job is removed and `ctx.Err()` returned; cancel it after the
+job has started and the limiter waits for the real result, because a `func()`
+cannot be interrupted.
+
+The limiter also owns a context, cancelled when `Stop` begins, that it passes to
+`LeaseDatastore` calls. A store blocked in `Acquire` or `Renew` — on a slow
+network, a lock, a queue of its own — is therefore released by shutdown rather
+than holding it open. If shutdown cancels an acquisition, the queued caller
+receives `ErrStoreClosed`: the job never ran, so the terminal shutdown error is
+the honest answer, not the internal cancellation.
+
+`Release` is deliberately exempt. Handing capacity back has to succeed *because*
+the process is going away, so it runs under a deadline of its own —
+`max(LeaseTTL, 5s)`, covering every retry. Past that the store reclaims the lease
+anyway, so a wedged store is reported through `OnError` and abandoned instead of
+blocking `Stop` indefinitely.
+
+These guarantees need a `LeaseDatastore`. The legacy `Datastore` interface takes
+no context, so `Request` and `RegisterDone` can only be waited out — one more
+reason the lease path is the one the limiter prefers.
+
 #### Error reporting
 
 Some failures have no caller to return them to. The most important is a failure
@@ -289,11 +317,15 @@ closes the client, for when the store is its sole user.
 - `ErrTaskPanic`: matched by the `*PanicError` returned when a scheduled task panics.
 - `ErrStoreClosed`: returned when scheduling against a stopped limiter or closed datastore.
 - `ErrQueueFull`: returned when the queue has reached `MaxQueueSize`.
+- `ErrLimiterConfigMismatch`: returned by `Acquire` when another instance already
+  registered this limiter ID with a different `MaxConcurrent`, `MinTime` or
+  `LeaseTTL`. See [Same-ID configuration consistency](#same-id-configuration-consistency).
 - `ErrInvalidMaxConcurrent`, `ErrInvalidMinTime`, `ErrInvalidMaxQueueSize`,
   `ErrInvalidRetryInterval`, `ErrInvalidSchedPolicy`: returned by `NewLimiter`
   and `Options.Validate` for negative or unknown configuration values.
-- `ErrNilClient`: returned by `NewRedisStore(nil)`. It unwraps to `ErrStoreClosed`,
-  which is what earlier versions returned.
+- `ErrNilClient`: returned by `NewRedisStore(nil)`, including a typed nil such as
+  `(*redis.Client)(nil)`. It unwraps to `ErrStoreClosed`, which is what earlier
+  versions returned.
 
 ### Storage Backends
 
@@ -316,6 +348,67 @@ store, err := gothrottle.NewRedisStore(rdb)
 
 `Disconnect()` releases the store but leaves `rdb` open, because the client is
 yours. Use `Close()` when the store is the only user of the client.
+
+`NewRedisStore` takes go-redis's `redis.UniversalClient`, which `*redis.Client`
+satisfies — so the call above is unchanged — as do `*redis.ClusterClient`,
+`*redis.Ring` and the Sentinel-backed failover client. A typed nil such as
+`(*redis.Client)(nil)` is rejected with `ErrNilClient` rather than accepted and
+panicked on later.
+
+##### Same-ID configuration consistency
+
+A limiter ID names a shared policy, so every instance using it must agree on the
+settings that decide admission:
+
+| Must match across instances | May differ per instance |
+| --- | --- |
+| `MaxConcurrent`, `MinTime`, `LeaseTTL` | `RetryInterval`, `MaxQueueSize`, `SchedPolicy`, `OnError`, `CloseDatastoreOnStop` |
+
+The first acquisition for an ID records the left-hand column; a later one that
+disagrees is refused with an error matching `ErrLimiterConfigMismatch`, naming
+both configurations. Without this the effective distributed limit would be
+whichever process happened to reach Redis first — a deployment mid-rollout would
+enforce two different limits at once and neither reliably. The right-hand column
+only shapes how one process queues its own work, so it is not compared.
+
+```go
+_, err := limiter.Schedule(work)
+if errors.Is(err, gothrottle.ErrLimiterConfigMismatch) {
+    // another instance registered this ID with different limits
+    log.Fatalf("gothrottle: %v", err)
+}
+```
+
+The record is not permanent. Once every lease has lapsed and the `MinTime` window
+has closed — that is, once the limiter is genuinely idle — the ID can be
+registered with new settings, so changing a limit is a matter of rolling out the
+new configuration and letting the old one drain. Rolling out the change while
+traffic is flowing will make the new instances report a mismatch until the old
+ones stop.
+
+##### Redis key layout
+
+Each limiter ID occupies four keys, all sharing one Redis Cluster hash tag:
+
+```text
+gothrottle:{<tag>}:leases        HASH    lease token -> reserved weight
+gothrottle:{<tag>}:expirations   ZSET    lease token -> expiry (µs, Redis clock)
+gothrottle:{<tag>}:last-start    STRING  µs timestamp of the last admission
+gothrottle:{<tag>}:config        HASH    MaxConcurrent, MinTime, LeaseTTL, ID
+```
+
+`<tag>` is a SHA-256 prefix of the limiter ID, not the ID itself: Redis takes the
+slot from the first `{...}`, so an ID containing braces would otherwise choose its
+own tag and could be steered onto another limiter's slot. `RedisKeys(id)` returns
+the four names if you need to inspect or clear state operationally.
+
+The legacy `Request`/`RegisterDone` path uses a single `gothrottle:<id>` hash,
+available as `RedisStateKey(id)`. It needs no tag, being single-key.
+
+**Cluster support status.** The key scheme is cluster-slot ready and
+`NewRedisStore` accepts a `*redis.ClusterClient`, but the combination is not
+covered by the test suite, which runs against standalone Redis 6 and 7. Treat
+standalone and Sentinel as supported, and Cluster as untested.
 
 ## Architecture
 
@@ -362,6 +455,38 @@ only `Request`/`RegisterDone` still works, on the older counter semantics.
 - **RedisStore**: Uses atomic Lua scripts, with the clock read from Redis `TIME`
   so coordinating instances need not agree on the time
 
+### Spacing outlives reservations
+
+`MinTime` is measured from when a job *started*, so the record of that start has to
+outlive the reservation it belongs to. The two are kept as separate state, and the
+distinction matters in four cases:
+
+| After | Why the window survives |
+| --- | --- |
+| Normal release | Release removes one lease token. It never touches the last-start record, so finishing early does not let the next job start early. |
+| Renewal | Renewal knows only the lease TTL. It extends the reservation's lifetime and leaves the spacing record's alone, which is derived from `MinTime`. |
+| Lease expiry | Reclaiming an expired lease purges reservation state only. The spacing record is not reservation state. |
+| Process crash | Same path as expiry: the dead holder's capacity comes back, but the spacing window it opened runs its course. |
+
+The failure mode this prevents is specific. Suppose `MinTime: 45s` with
+`LeaseTTL: 1s`. If the spacing record's lifetime were tied to the lease — as it
+was when start times were stored per lease token — a release or a renewal would
+leave roughly two seconds protecting a forty-five second window. Once it expired,
+the next job would start immediately, and nothing in the logs would say the limit
+had stopped applying. A crashed holder was worse: purging its lease purged its
+start time with it, so the crash itself granted the next job a free start.
+
+So: the last-start value is written only on a successful admission, never deleted
+or shortened by renewal, release or reclamation, and its own garbage-collection
+window is derived from `MinTime` alone (at least `2 × MinTime`). With `MinTime`
+unset there is no window to enforce and no record is written at all.
+
+Key lifetimes are only ever extended, never shortened. A short-lived operation —
+a release with a one-second lease TTL, say — cannot cut short a key protecting a
+longer window, in either the lease scripts or the legacy `Request`/`RegisterDone`
+pair. The same asymmetry used to bite there: `Request` sized the state TTL to
+cover `MinTime`, and `RegisterDone` reset it to a flat 30 seconds.
+
 ## Project Structure
 
 ```text
@@ -387,9 +512,14 @@ gothrottle/
 │   ├── limiter_test.go          # Core limiter unit tests
 │   ├── scheduler_test.go        # Scheduler throughput and ordering
 │   ├── shutdown_test.go         # Shutdown and datastore ownership
+│   ├── cancellation_test.go     # Shutdown cancellation of store operations
 │   ├── options_test.go          # Configuration validation
 │   ├── context_test.go          # Context cancellation and error reporting
 │   ├── lease_test.go            # Lease contract, both stores
+│   ├── spacing_test.go          # MinTime independence from lease lifecycle
+│   ├── legacy_state_test.go     # Request/RegisterDone state and TTL behavior
+│   ├── config_consistency_test.go # Same-ID configuration agreement
+│   ├── redis_keys_test.go       # Key layout, hash tags, client types
 │   ├── adversarial_test.go      # Failure-scenario coverage
 │   ├── integration_test.go      # Integration tests and benchmarks
 │   ├── redis_helpers_test.go    # Redis test helpers
