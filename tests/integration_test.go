@@ -163,8 +163,13 @@ func BenchmarkLimiter(b *testing.B) {
 
 func TestRedisStore_NilClient(t *testing.T) {
 	_, err := gothrottle.NewRedisStore(nil)
+	if !errors.Is(err, gothrottle.ErrNilClient) {
+		t.Fatalf("NewRedisStore(nil) error = %v, want ErrNilClient", err)
+	}
+	// ErrNilClient unwraps to ErrStoreClosed so code written against the
+	// previous behavior keeps working.
 	if !errors.Is(err, gothrottle.ErrStoreClosed) {
-		t.Fatalf("NewRedisStore(nil) error = %v, want ErrStoreClosed", err)
+		t.Fatalf("NewRedisStore(nil) error = %v, want it to also match ErrStoreClosed", err)
 	}
 }
 
@@ -186,6 +191,171 @@ func TestRedisStore_ClosedClientBehavior(t *testing.T) {
 
 	if err := store.RegisterDone("closed", 1); !errors.Is(err, gothrottle.ErrStoreClosed) {
 		t.Fatalf("closed RegisterDone error = %v, want ErrStoreClosed", err)
+	}
+}
+
+func TestRedisStore_MinTimeUsesRedisClock(t *testing.T) {
+	client := newTestRedisClient(t)
+
+	store, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore failed: %v", err)
+	}
+	defer func() { _ = store.Disconnect() }()
+
+	id := uniqueLimiterID("redis-mintime")
+	opts := gothrottle.Options{MinTime: 300 * time.Millisecond}
+
+	canRun, _, err := store.Request(id, 1, opts)
+	if err != nil {
+		t.Fatalf("first Request failed: %v", err)
+	}
+	if !canRun {
+		t.Fatal("first Request should be allowed")
+	}
+
+	canRun, waitTime, err := store.Request(id, 1, opts)
+	if err != nil {
+		t.Fatalf("second Request failed: %v", err)
+	}
+	if canRun {
+		t.Fatal("second Request should be refused by MinTime")
+	}
+	if waitTime <= 0 || waitTime > 300*time.Millisecond {
+		t.Fatalf("waitTime = %v, want in (0, 300ms]", waitTime)
+	}
+
+	time.Sleep(waitTime + 20*time.Millisecond)
+
+	canRun, _, err = store.Request(id, 1, opts)
+	if err != nil {
+		t.Fatalf("third Request failed: %v", err)
+	}
+	if !canRun {
+		t.Fatal("Request after the MinTime window should be allowed")
+	}
+}
+
+func TestRedisStore_SubMillisecondMinTime(t *testing.T) {
+	client := newTestRedisClient(t)
+
+	store, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore failed: %v", err)
+	}
+	defer func() { _ = store.Disconnect() }()
+
+	// MinTime below 1ms used to truncate to zero through .Milliseconds(),
+	// silently disabling spacing that LocalStore honored — so the old code could
+	// never refuse this request, no matter how quickly the second one arrived.
+	// One refusal across several attempts is therefore conclusive; a single
+	// attempt is not, because a Redis round trip can itself exceed the window.
+	opts := gothrottle.Options{MinTime: 900 * time.Microsecond}
+
+	refused := false
+	for attempt := 0; attempt < 20 && !refused; attempt++ {
+		id := uniqueLimiterID("redis-submilli")
+
+		if canRun, _, err := store.Request(id, 1, opts); err != nil || !canRun {
+			t.Fatalf("first Request = (%v, %v), want (true, nil)", canRun, err)
+		}
+
+		canRun, waitTime, err := store.Request(id, 1, opts)
+		if err != nil {
+			t.Fatalf("second Request failed: %v", err)
+		}
+		if canRun {
+			continue
+		}
+		refused = true
+
+		if waitTime <= 0 || waitTime > 900*time.Microsecond {
+			t.Fatalf("waitTime = %v, want in (0, 900µs]", waitTime)
+		}
+	}
+
+	if !refused {
+		t.Fatal("a sub-millisecond MinTime never refused a request; it is being truncated away")
+	}
+}
+
+func TestRedisStore_WaitTimeKeepsSubMillisecondPrecision(t *testing.T) {
+	client := newTestRedisClient(t)
+
+	store, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore failed: %v", err)
+	}
+	defer func() { _ = store.Disconnect() }()
+
+	// The old script did all arithmetic in whole milliseconds, so every wait it
+	// returned was an exact multiple of 1ms. With microsecond precision a whole
+	// millisecond is a 1-in-1000 coincidence, so one non-multiple across several
+	// attempts proves the precision is preserved.
+	opts := gothrottle.Options{MinTime: 50 * time.Millisecond}
+
+	for attempt := 0; attempt < 5; attempt++ {
+		id := uniqueLimiterID("redis-wait-precision")
+
+		if canRun, _, err := store.Request(id, 1, opts); err != nil || !canRun {
+			t.Fatalf("first Request = (%v, %v), want (true, nil)", canRun, err)
+		}
+
+		canRun, waitTime, err := store.Request(id, 1, opts)
+		if err != nil {
+			t.Fatalf("second Request failed: %v", err)
+		}
+		if canRun {
+			t.Fatal("second Request should be refused by a 50ms MinTime")
+		}
+		if waitTime%time.Millisecond != 0 {
+			return
+		}
+	}
+
+	t.Fatal("every waitTime was an exact multiple of 1ms; sub-millisecond precision is being truncated")
+}
+
+func TestRedisStore_LongMinTimeSurvivesStateTTL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow MinTime/TTL interaction test in -short mode")
+	}
+
+	client := newTestRedisClient(t)
+
+	store, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore failed: %v", err)
+	}
+	defer func() { _ = store.Disconnect() }()
+
+	id := uniqueLimiterID("redis-long-mintime")
+	// A MinTime longer than the 30s state TTL used to be bypassed entirely once
+	// the key expired. The TTL now scales with MinTime, so the key must still be
+	// alive — and the spacing still enforced — well past 30s.
+	opts := gothrottle.Options{MinTime: 40 * time.Second}
+
+	if canRun, _, err := store.Request(id, 1, opts); err != nil || !canRun {
+		t.Fatalf("first Request = (%v, %v), want (true, nil)", canRun, err)
+	}
+
+	ttl, err := client.PTTL(context.Background(), "gothrottle:"+id).Result()
+	if err != nil {
+		t.Fatalf("PTTL failed: %v", err)
+	}
+	if ttl <= opts.MinTime {
+		t.Fatalf("state TTL = %v, want longer than MinTime %v so the spacing cannot be bypassed", ttl, opts.MinTime)
+	}
+
+	canRun, waitTime, err := store.Request(id, 1, opts)
+	if err != nil {
+		t.Fatalf("second Request failed: %v", err)
+	}
+	if canRun {
+		t.Fatal("second Request should be refused by a 40s MinTime")
+	}
+	if waitTime <= 30*time.Second {
+		t.Fatalf("waitTime = %v, want more than 30s", waitTime)
 	}
 }
 

@@ -125,8 +125,20 @@ type Options struct {
 
     // How often to re-check a distributed store while blocked (default 10ms)
     RetryInterval time.Duration
+
+    // Cap on queued jobs; further submissions get ErrQueueFull (0 = unbounded)
+    MaxQueueSize int
+
+    // Receives errors that have no caller to return them to
+    OnError func(error)
 }
 ```
+
+Negative values for `MaxConcurrent`, `MinTime`, `MaxQueueSize` or
+`RetryInterval` are rejected by `NewLimiter` rather than being treated as
+"unlimited" — a miscalculated limit fails loudly instead of silently switching
+throttling off. Zero keeps its meaning of "no limit" or "use the default". You
+can also call `opts.Validate()` yourself.
 
 ### Scheduling
 
@@ -171,6 +183,31 @@ Returns `ErrNilTask` for nil tasks, `ErrInvalidWeight` for non-positive weights,
 
 Returns a wrapped version of the function that applies rate limiting.
 
+#### `ScheduleContext(ctx context.Context, task func() (interface{}, error)) (interface{}, error)`
+
+Like `Schedule`, but bounded by a context. If `ctx` ends while the job is still
+queued, the job is removed from the queue and `ctx.Err()` is returned. A job that
+has already started runs to completion — the limiter cannot interrupt a task
+function — and its real result is returned rather than a cancellation that did
+not happen.
+
+`ScheduleWithOptionsContext` is the same with a custom priority and weight.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+
+result, err := limiter.ScheduleContext(ctx, fetchPage)
+if errors.Is(err, context.DeadlineExceeded) {
+    // gave up waiting in the queue
+}
+```
+
+#### `QueueLen() int` and `Running() int`
+
+Point-in-time queue depth and the total weight currently executing, for
+monitoring against `MaxQueueSize` and `MaxConcurrent`.
+
 #### `Stop() error`
 
 Stops the limiter and cleans up resources.
@@ -181,6 +218,37 @@ whose capacity request was already in flight. It is safe to call concurrently
 and repeatedly; every caller blocks until shutdown completes and receives the
 same error. Do not call `Stop` from inside a scheduled task: it waits for that
 task to finish.
+
+#### Error reporting
+
+Some failures have no caller to return them to. The most important is a failure
+to hand capacity back to the datastore after a job finishes: the store keeps that
+capacity reserved for work that has already completed. The limiter retries, then
+reports through `OnError`:
+
+```go
+limiter, _ := gothrottle.NewLimiter(gothrottle.Options{
+    ID:            "api",
+    MaxConcurrent: 10,
+    Datastore:     store,
+    OnError: func(err error) {
+        log.Printf("gothrottle: %v", err)
+    },
+})
+```
+
+`OnError` is called from limiter goroutines, so it must be safe for concurrent
+use and must not block or call back into the limiter.
+
+Task panics are recovered and returned as a `*PanicError` that matches
+`errors.Is(err, ErrTaskPanic)` and carries the stack trace:
+
+```go
+var panicErr *gothrottle.PanicError
+if errors.As(err, &panicErr) {
+    log.Printf("task panicked: %v\n%s", panicErr.Value, panicErr.Stack)
+}
+```
 
 #### Datastore ownership
 
@@ -212,8 +280,14 @@ closes the client, for when the store is its sole user.
 - `ErrInvalidWeight`: returned when a job or datastore operation uses a non-positive weight.
 - `ErrWeightExceedsMax`: returned when a job weight exceeds the configured `MaxConcurrent` limit.
 - `ErrNilTask`: returned when scheduling a nil task function.
-- `ErrTaskPanic`: wraps panics from scheduled task functions and returns them as errors.
+- `ErrTaskPanic`: matched by the `*PanicError` returned when a scheduled task panics.
 - `ErrStoreClosed`: returned when scheduling against a stopped limiter or closed datastore.
+- `ErrQueueFull`: returned when the queue has reached `MaxQueueSize`.
+- `ErrInvalidMaxConcurrent`, `ErrInvalidMinTime`, `ErrInvalidMaxQueueSize`,
+  `ErrInvalidRetryInterval`, `ErrInvalidSchedPolicy`: returned by `NewLimiter`
+  and `Options.Validate` for negative or unknown configuration values.
+- `ErrNilClient`: returned by `NewRedisStore(nil)`. It unwraps to `ErrStoreClosed`,
+  which is what earlier versions returned.
 
 ### Storage Backends
 

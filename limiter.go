@@ -2,9 +2,18 @@
 package gothrottle
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
+)
+
+// Defaults applied by Schedule and ScheduleContext.
+const (
+	defaultPriority = 5
+	defaultWeight   = 1
 )
 
 // Limiter manages job scheduling and rate limiting.
@@ -56,10 +65,8 @@ func NewLimiter(opts Options) (*Limiter, error) {
 	if opts.Datastore != nil && opts.ID == "" {
 		return nil, ErrMissingID
 	}
-	if opts.ID != "" {
-		if err := validateLimiterID(opts.ID); err != nil {
-			return nil, err
-		}
+	if err := opts.Validate(); err != nil {
+		return nil, err
 	}
 
 	// Default to LocalStore if no datastore is provided. A store the limiter
@@ -93,11 +100,32 @@ func NewLimiter(opts Options) (*Limiter, error) {
 
 // Schedule submits a job to be executed and blocks until completion.
 func (l *Limiter) Schedule(task func() (interface{}, error)) (interface{}, error) {
-	return l.ScheduleWithOptions(task, 5, 1) // Default priority 5, weight 1
+	return l.ScheduleWithOptions(task, defaultPriority, defaultWeight)
 }
 
 // ScheduleWithOptions submits a job with custom priority and weight.
 func (l *Limiter) ScheduleWithOptions(task func() (interface{}, error), priority, weight int) (interface{}, error) {
+	return l.schedule(context.Background(), task, priority, weight)
+}
+
+// ScheduleContext submits a job and blocks until it completes or ctx is done.
+// If ctx ends while the job is still queued, the job is removed from the queue
+// and ctx.Err() is returned; a job that has already started is left to run to
+// completion, since the limiter cannot interrupt a task function.
+func (l *Limiter) ScheduleContext(ctx context.Context, task func() (interface{}, error)) (interface{}, error) {
+	return l.schedule(ctx, task, defaultPriority, defaultWeight)
+}
+
+// ScheduleWithOptionsContext is ScheduleContext with a custom priority and
+// weight.
+func (l *Limiter) ScheduleWithOptionsContext(ctx context.Context, task func() (interface{}, error), priority, weight int) (interface{}, error) {
+	return l.schedule(ctx, task, priority, weight)
+}
+
+func (l *Limiter) schedule(ctx context.Context, task func() (interface{}, error), priority, weight int) (interface{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if task == nil {
 		return nil, ErrNilTask
 	}
@@ -106,6 +134,9 @@ func (l *Limiter) ScheduleWithOptions(task func() (interface{}, error), priority
 	}
 	if l.opts.MaxConcurrent > 0 && weight > l.opts.MaxConcurrent {
 		return nil, ErrWeightExceedsMax
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	job := &Job{
@@ -122,16 +153,43 @@ func (l *Limiter) ScheduleWithOptions(task func() (interface{}, error), priority
 		l.mu.Unlock()
 		return nil, ErrStoreClosed
 	}
+	if l.opts.MaxQueueSize > 0 && l.queue.Len() >= l.opts.MaxQueueSize {
+		l.mu.Unlock()
+		return nil, ErrQueueFull
+	}
 	l.seq++
 	job.seq = l.seq
 	l.queue.PushJob(job)
 	l.mu.Unlock()
 
-	// Wake the scheduler so the job is considered immediately rather than on
-	// the next tick.
+	// Wake the scheduler so the job is considered immediately.
 	l.signal()
 
 	// Wait for job completion
+	select {
+	case result := <-job.resultChan:
+		return result, nil
+	case err := <-job.errorChan:
+		return nil, err
+	case <-ctx.Done():
+		return l.cancelQueued(job, ctx.Err())
+	}
+}
+
+// cancelQueued handles a context that ended while the caller was waiting. A job
+// still in the queue is removed and the context error returned. A job that has
+// already been dispatched cannot be interrupted, so its real outcome is awaited
+// and returned instead — reporting a cancellation while the task keeps running
+// would misrepresent what happened.
+func (l *Limiter) cancelQueued(job *Job, cause error) (interface{}, error) {
+	l.mu.Lock()
+	removed := l.queue.Remove(job)
+	l.mu.Unlock()
+
+	if removed {
+		return nil, cause
+	}
+
 	select {
 	case result := <-job.resultChan:
 		return result, nil
@@ -155,6 +213,22 @@ func (l *Limiter) Wrap(fn func() (interface{}, error)) func() (interface{}, erro
 	return func() (interface{}, error) {
 		return l.Schedule(fn)
 	}
+}
+
+// QueueLen returns how many jobs are waiting for capacity. It is a point-in-time
+// reading, useful for monitoring queue depth against Options.MaxQueueSize.
+func (l *Limiter) QueueLen() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.queue.Len()
+}
+
+// Running returns the total weight of jobs currently executing. Unweighted jobs
+// count as 1 each, so this is the job count in the common case.
+func (l *Limiter) Running() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.localWeight
 }
 
 // start begins the scheduler goroutine.
@@ -389,7 +463,9 @@ func (l *Limiter) executeJob(job *Job) {
 	defer l.workerWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
-			l.failJob(job, fmt.Errorf("%w: %v", ErrTaskPanic, r))
+			// Capture the stack here, while it is still the panicking
+			// goroutine's; by the time the caller sees the error it is gone.
+			l.failJob(job, &PanicError{Value: r, Stack: debug.Stack()})
 		}
 
 		l.mu.Lock()
@@ -418,12 +494,32 @@ func (l *Limiter) executeJob(job *Job) {
 	}
 }
 
-// releaseCapacity returns a job's reserved weight to the datastore.
+// releaseCapacity hands a job's reserved weight back to the datastore. Losing
+// this call permanently inflates the store's running count — capacity stays
+// reserved for work that has finished — so it is retried before being reported
+// through Options.OnError.
 func (l *Limiter) releaseCapacity(weight int) {
-	if err := l.datastore.RegisterDone(l.opts.ID, weight); err != nil {
-		// TODO(phase 4): surface through Options.OnError with retries.
-		_ = err
+	var err error
+	for attempt := 1; attempt <= defaultRegisterDoneAttempts; attempt++ {
+		err = l.datastore.RegisterDone(l.opts.ID, weight)
+		if err == nil {
+			return
+		}
+		// A closed store will not recover, and during shutdown this is expected.
+		if errors.Is(err, ErrStoreClosed) {
+			break
+		}
+		if attempt < defaultRegisterDoneAttempts {
+			select {
+			case <-time.After(time.Duration(attempt) * l.opts.retryInterval()):
+			case <-l.stopCh:
+				// Try once more immediately, then give up: Stop is waiting on
+				// this worker.
+			}
+		}
 	}
+
+	l.opts.reportError(fmt.Errorf("failed to release capacity for limiter %q (weight %d): %w", l.opts.ID, weight, err))
 }
 
 // failJob delivers a terminal error to a job's caller without blocking. The
