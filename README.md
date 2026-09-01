@@ -83,12 +83,14 @@ func main() {
     rdb := redis.NewClient(&redis.Options{
         Addr: "localhost:6379",
     })
+    defer rdb.Close() // the client is yours; the limiter never closes it
 
     // Create Redis store
     store, err := gothrottle.NewRedisStore(rdb)
     if err != nil {
         panic(err)
     }
+    defer store.Disconnect()
 
     // Create limiter with Redis backend
     limiter, err := gothrottle.NewLimiter(gothrottle.Options{
@@ -357,19 +359,23 @@ automatically. The interface is additive: a custom `Datastore` that implements
 only `Request`/`RegisterDone` still works, on the older counter semantics.
 
 - **LocalStore**: Uses Go mutexes and in-memory state
-- **RedisStore**: Uses atomic Lua scripts for race-condition-free distributed coordination
+- **RedisStore**: Uses atomic Lua scripts, with the clock read from Redis `TIME`
+  so coordinating instances need not agree on the time
 
 ## Project Structure
 
 ```text
 gothrottle/
 ├── datastore.go         # Datastore interface definition
-├── options.go          # Configuration options
+├── lease.go            # LeaseDatastore interface and Lease type
+├── options.go          # Configuration options and validation
 ├── job.go             # Job struct and priority queue
 ├── local_store.go     # In-memory storage implementation
+├── local_lease.go     # In-memory lease implementation
 ├── redis_store.go     # Redis-based storage implementation
+├── redis_lease.go     # Redis lease implementation and Lua scripts
 ├── limiter.go         # Main Limiter struct and logic
-├── errors.go          # Common error definitions
+├── errors.go          # Common error definitions and PanicError
 ├── assets/            # Visual assets and branding
 │   ├── logo.svg                 # Vector logo
 │   ├── logo-*.png              # PNG logos (64px, 128px, 256px, 512px)
@@ -379,7 +385,14 @@ gothrottle/
 ├── tests/             # Test files
 │   ├── examples_test.go         # Basic usage examples
 │   ├── limiter_test.go          # Core limiter unit tests
+│   ├── scheduler_test.go        # Scheduler throughput and ordering
+│   ├── shutdown_test.go         # Shutdown and datastore ownership
+│   ├── options_test.go          # Configuration validation
+│   ├── context_test.go          # Context cancellation and error reporting
+│   ├── lease_test.go            # Lease contract, both stores
+│   ├── adversarial_test.go      # Failure-scenario coverage
 │   ├── integration_test.go      # Integration tests and benchmarks
+│   ├── redis_helpers_test.go    # Redis test helpers
 │   ├── database_test.go         # Database throttling tests
 │   └── advanced_database_test.go # Advanced DB operations with weights
 ├── .github/           # GitHub workflows and templates
