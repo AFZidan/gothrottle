@@ -58,6 +58,15 @@ var (
 
 	// ErrQueueFull is returned when the queue has reached MaxQueueSize.
 	ErrQueueFull = errors.New("limiter queue is full")
+
+	// ErrLimiterConfigMismatch is returned by a LeaseDatastore when the
+	// admission-relevant configuration supplied for a limiter ID disagrees with
+	// the configuration already recorded for it. Sharing an ID with different
+	// MaxConcurrent, MinTime or LeaseTTL values makes the effective distributed
+	// policy depend on which process reaches the store first, so it is rejected
+	// rather than silently resolved. Errors wrapping it carry both
+	// configurations.
+	ErrLimiterConfigMismatch = errors.New("limiter configuration does not match the configuration already registered for this ID")
 )
 
 // nilClientError implements ErrNilClient. It is a type rather than
