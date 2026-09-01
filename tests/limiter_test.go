@@ -415,6 +415,68 @@ func TestPublicAPICompatibility(t *testing.T) {
 	}
 }
 
+// TestDatastoreInterfaceIsStillSufficient pins the additive nature of the lease
+// redesign: a store implementing only the original three methods must keep
+// working, since LeaseDatastore embeds rather than replaces Datastore.
+func TestDatastoreInterfaceIsStillSufficient(t *testing.T) {
+	var store gothrottle.Datastore = &legacyOnlyStore{}
+
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{
+		ID:            "legacy-store",
+		MaxConcurrent: 1,
+		Datastore:     store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = limiter.Stop() }()
+
+	result, err := limiter.Schedule(func() (interface{}, error) { return "legacy", nil })
+	if err != nil {
+		t.Fatalf("Schedule against a legacy Datastore failed: %v", err)
+	}
+	if result != "legacy" {
+		t.Fatalf("result = %v, want \"legacy\"", result)
+	}
+}
+
+// legacyOnlyStore implements Datastore and nothing else.
+type legacyOnlyStore struct {
+	mu      sync.Mutex
+	running int
+}
+
+func (s *legacyOnlyStore) Request(_ string, weight int, opts gothrottle.Options) (bool, time.Duration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if opts.MaxConcurrent > 0 && s.running+weight > opts.MaxConcurrent {
+		return false, 0, nil
+	}
+	s.running += weight
+	return true, 0, nil
+}
+
+func (s *legacyOnlyStore) RegisterDone(_ string, weight int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.running -= weight
+	if s.running < 0 {
+		s.running = 0
+	}
+	return nil
+}
+
+func (s *legacyOnlyStore) Disconnect() error { return nil }
+
+// TestBuiltInStoresImplementLeaseDatastore fails at compile time if either
+// built-in store loses its lease support.
+func TestBuiltInStoresImplementLeaseDatastore(t *testing.T) {
+	var _ gothrottle.LeaseDatastore = gothrottle.NewLocalStore()
+	var _ gothrottle.LeaseDatastore = (*gothrottle.RedisStore)(nil)
+}
+
 func TestLocalStore_Basic(t *testing.T) {
 	store := gothrottle.NewLocalStore()
 	opts := gothrottle.Options{
