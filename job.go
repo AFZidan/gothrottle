@@ -20,6 +20,11 @@ type Job struct {
 	// enqueued so equal-priority work runs first-in-first-out; container/heap
 	// is not stable, so without it equal priorities run in arbitrary order.
 	seq uint64
+
+	// lease is the capacity reservation this job holds, when the datastore
+	// tracks individual leases. Releasing by lease token means a late release
+	// from an expired job cannot disturb a newer job's reservation.
+	lease *Lease
 }
 
 // PriorityQueue implements heap.Interface and holds Jobs.

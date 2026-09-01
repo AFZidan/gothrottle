@@ -200,30 +200,50 @@ func TestScheduleContext_WithOptions(t *testing.T) {
 	}
 }
 
-// failingDoneStore fails RegisterDone a configurable number of times so the
-// retry and OnError paths are observable.
+// failingDoneStore implements only Datastore — deliberately not LeaseDatastore —
+// so it exercises the legacy Request/RegisterDone path, and fails RegisterDone a
+// configurable number of times to make the retry and OnError paths observable.
 type failingDoneStore struct {
-	*gothrottle.LocalStore
 	mu        sync.Mutex
+	running   int
 	failures  int
 	attempts  int
 	permanent bool
 }
 
-func (f *failingDoneStore) RegisterDone(id string, weight int) error {
+func (f *failingDoneStore) Request(_ string, weight int, opts gothrottle.Options) (bool, time.Duration, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if opts.MaxConcurrent > 0 && f.running+weight > opts.MaxConcurrent {
+		return false, 0, nil
+	}
+	f.running += weight
+	return true, 0, nil
+}
+
+func (f *failingDoneStore) RegisterDone(_ string, weight int) error {
 	f.mu.Lock()
 	f.attempts++
 	shouldFail := f.permanent || f.failures > 0
 	if f.failures > 0 {
 		f.failures--
 	}
+	if !shouldFail {
+		f.running -= weight
+		if f.running < 0 {
+			f.running = 0
+		}
+	}
 	f.mu.Unlock()
 
 	if shouldFail {
 		return errors.New("simulated store failure")
 	}
-	return f.LocalStore.RegisterDone(id, weight)
+	return nil
 }
+
+func (f *failingDoneStore) Disconnect() error { return nil }
 
 func (f *failingDoneStore) attemptCount() int {
 	f.mu.Lock()
@@ -232,7 +252,7 @@ func (f *failingDoneStore) attemptCount() int {
 }
 
 func TestLimiter_RegisterDoneIsRetried(t *testing.T) {
-	store := &failingDoneStore{LocalStore: gothrottle.NewLocalStore(), failures: 2}
+	store := &failingDoneStore{failures: 2}
 
 	var reported []error
 	var mu sync.Mutex
@@ -274,7 +294,7 @@ func TestLimiter_RegisterDoneIsRetried(t *testing.T) {
 }
 
 func TestLimiter_RegisterDoneFailureIsReported(t *testing.T) {
-	store := &failingDoneStore{LocalStore: gothrottle.NewLocalStore(), permanent: true}
+	store := &failingDoneStore{permanent: true}
 
 	reported := make(chan error, 4)
 	limiter, err := gothrottle.NewLimiter(gothrottle.Options{

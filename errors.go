@@ -44,6 +44,9 @@ var (
 	// ErrInvalidRetryInterval is returned when RetryInterval is negative.
 	ErrInvalidRetryInterval = errors.New("RetryInterval must not be negative")
 
+	// ErrInvalidLeaseTTL is returned when LeaseTTL is negative.
+	ErrInvalidLeaseTTL = errors.New("LeaseTTL must not be negative")
+
 	// ErrInvalidSchedPolicy is returned when SchedPolicy is not a known policy.
 	ErrInvalidSchedPolicy = errors.New("SchedPolicy is not a known scheduling policy")
 

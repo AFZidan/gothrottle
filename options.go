@@ -64,6 +64,13 @@ type Options struct {
 	// the queue without bound. 0 means unbounded.
 	MaxQueueSize int
 
+	// LeaseTTL is how long a capacity reservation survives without renewal,
+	// when the datastore implements LeaseDatastore. It bounds how long a
+	// crashed process can hold capacity; the limiter renews every LeaseTTL/3
+	// while a job runs, so a long-running job is not affected. Defaults to 30s,
+	// clamped to a 1s minimum.
+	LeaseTTL time.Duration
+
 	// OnError receives errors that have no caller to return them to — most
 	// importantly a failure to hand capacity back to the datastore, which
 	// otherwise leaves capacity reserved with no visibility. It is called from
@@ -93,6 +100,9 @@ func (o Options) Validate() error {
 	}
 	if o.RetryInterval < 0 {
 		return ErrInvalidRetryInterval
+	}
+	if o.LeaseTTL < 0 {
+		return ErrInvalidLeaseTTL
 	}
 	switch o.SchedPolicy {
 	case SchedStrict, SchedBestFit:

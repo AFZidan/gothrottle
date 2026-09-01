@@ -21,6 +21,11 @@ type Limiter struct {
 	opts      Options
 	datastore Datastore
 
+	// leaseStore is set when the datastore tracks individual reservations. The
+	// limiter prefers it because a shared counter cannot distinguish a slow job
+	// from a dead one; a nil value means the legacy Request/RegisterDone path.
+	leaseStore LeaseDatastore
+
 	// ownsDatastore records whether Stop is allowed to disconnect the
 	// datastore. It is only true for the LocalStore the limiter creates for
 	// itself, or when the caller opts in with Options.CloseDatastoreOnStop.
@@ -90,6 +95,9 @@ func NewLimiter(opts Options) (*Limiter, error) {
 		wake:          make(chan struct{}, 1),
 		stopCh:        make(chan struct{}),
 		stoppedCh:     make(chan struct{}),
+	}
+	if leaseStore, ok := datastore.(LeaseDatastore); ok {
+		limiter.leaseStore = leaseStore
 	}
 
 	// Start the scheduler
@@ -343,7 +351,7 @@ func (l *Limiter) dispatch() time.Duration {
 			return 0
 		}
 
-		canRun, waitTime, err := l.datastore.Request(l.opts.ID, job.Weight, l.opts)
+		granted, waitTime, err := l.acquireCapacity(job)
 		if err != nil {
 			// The claimed job is not requeued: its caller is unblocked with the
 			// error and decides whether to retry. Back off before touching the
@@ -353,7 +361,7 @@ func (l *Limiter) dispatch() time.Duration {
 			return l.opts.retryInterval()
 		}
 
-		if !canRun {
+		if !granted {
 			if !l.releaseJob(job) {
 				l.failJob(job, ErrStoreClosed)
 				return 0
@@ -377,11 +385,32 @@ func (l *Limiter) dispatch() time.Duration {
 		// task must never begin after shutdown started. The reservation is handed
 		// back so the capacity is not leaked for other limiters sharing the store.
 		if !l.startJob(job) {
-			l.releaseCapacity(job.Weight)
+			l.releaseCapacity(job)
 			l.failJob(job, ErrStoreClosed)
 			return 0
 		}
 	}
+}
+
+// acquireCapacity reserves capacity for a job. With a LeaseDatastore the
+// resulting lease is attached to the job, so its release later targets that one
+// reservation rather than decrementing a shared counter.
+func (l *Limiter) acquireCapacity(job *Job) (granted bool, retryAfter time.Duration, err error) {
+	if l.leaseStore == nil {
+		canRun, waitTime, err := l.datastore.Request(l.opts.ID, job.Weight, l.opts)
+		return canRun, waitTime, err
+	}
+
+	lease, retryAfter, err := l.leaseStore.Acquire(context.Background(), l.opts.ID, job.Weight, l.opts)
+	if err != nil {
+		return false, 0, err
+	}
+	if lease == nil {
+		return false, retryAfter, nil
+	}
+
+	job.lease = lease
+	return true, 0, nil
 }
 
 // claimNextJob removes the next dispatchable job from the queue. It returns nil
@@ -461,12 +490,20 @@ func (l *Limiter) startJob(job *Job) bool {
 // executeJob runs a job and handles its completion.
 func (l *Limiter) executeJob(job *Job) {
 	defer l.workerWG.Done()
+
+	// A lease expires unless it is renewed, which is what lets the store tell a
+	// dead holder from a slow one. Renew for as long as the task runs so a job
+	// longer than the TTL keeps its capacity.
+	stopRenewal := l.startRenewal(job)
+
 	defer func() {
 		if r := recover(); r != nil {
 			// Capture the stack here, while it is still the panicking
 			// goroutine's; by the time the caller sees the error it is gone.
 			l.failJob(job, &PanicError{Value: r, Stack: debug.Stack()})
 		}
+
+		stopRenewal()
 
 		l.mu.Lock()
 		l.localWeight -= job.Weight
@@ -475,7 +512,7 @@ func (l *Limiter) executeJob(job *Job) {
 		}
 		l.mu.Unlock()
 
-		l.releaseCapacity(job.Weight)
+		l.releaseCapacity(job)
 		// Freed capacity may let queued work start immediately.
 		l.signal()
 	}()
@@ -494,20 +531,68 @@ func (l *Limiter) executeJob(job *Job) {
 	}
 }
 
-// releaseCapacity hands a job's reserved weight back to the datastore. Losing
-// this call permanently inflates the store's running count — capacity stays
-// reserved for work that has finished — so it is retried before being reported
-// through Options.OnError.
-func (l *Limiter) releaseCapacity(weight int) {
+// startRenewal keeps a job's lease alive for as long as it runs and returns a
+// function that stops the renewal. With no lease store it is a no-op.
+func (l *Limiter) startRenewal(job *Job) func() {
+	if l.leaseStore == nil || job.lease == nil {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		ticker := time.NewTicker(l.opts.renewInterval())
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				err := l.leaseStore.Renew(context.Background(), job.lease)
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, ErrStoreClosed) {
+					return
+				}
+				// A lost lease means the store handed this capacity to someone
+				// else, so the limit is already being exceeded. The task cannot
+				// be interrupted, so report it and stop renewing.
+				l.opts.reportError(fmt.Errorf("lease renewal failed for limiter %q: %w", l.opts.ID, err))
+				if errors.Is(err, ErrLeaseLost) {
+					return
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-stopped
+	}
+}
+
+// releaseCapacity hands a job's reservation back to the datastore. Losing this
+// call leaves capacity reserved for work that has already finished, so it is
+// retried before being reported through Options.OnError.
+func (l *Limiter) releaseCapacity(job *Job) {
 	var err error
 	for attempt := 1; attempt <= defaultRegisterDoneAttempts; attempt++ {
-		err = l.datastore.RegisterDone(l.opts.ID, weight)
+		err = l.releaseOnce(job)
 		if err == nil {
 			return
 		}
 		// A closed store will not recover, and during shutdown this is expected.
 		if errors.Is(err, ErrStoreClosed) {
 			break
+		}
+		// The lease is already gone, so there is nothing left to hand back.
+		if errors.Is(err, ErrLeaseLost) {
+			return
 		}
 		if attempt < defaultRegisterDoneAttempts {
 			select {
@@ -519,7 +604,16 @@ func (l *Limiter) releaseCapacity(weight int) {
 		}
 	}
 
-	l.opts.reportError(fmt.Errorf("failed to release capacity for limiter %q (weight %d): %w", l.opts.ID, weight, err))
+	l.opts.reportError(fmt.Errorf("failed to release capacity for limiter %q (weight %d): %w", l.opts.ID, job.Weight, err))
+}
+
+// releaseOnce performs a single release attempt against whichever store
+// interface is in use.
+func (l *Limiter) releaseOnce(job *Job) error {
+	if l.leaseStore != nil && job.lease != nil {
+		return l.leaseStore.Release(context.Background(), job.lease)
+	}
+	return l.datastore.RegisterDone(l.opts.ID, job.Weight)
 }
 
 // failJob delivers a terminal error to a job's caller without blocking. The

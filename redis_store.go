@@ -109,7 +109,7 @@ func (rs *RedisStore) loadScriptLocked() error {
 		return ErrStoreClosed
 	}
 
-	sha := fmt.Sprintf("%x", sha1.Sum([]byte(redisScript))) // #nosec G401 - SHA1 is used for Redis script hashing, not cryptographic security
+	sha := scriptSHA(redisScript)
 
 	// Check if script already exists
 	exists, err := rs.client.ScriptExists(rs.ctx, sha).Result()
@@ -130,6 +130,12 @@ func (rs *RedisStore) loadScriptLocked() error {
 
 	rs.scriptSHA = loadedSHA
 	return nil
+}
+
+// scriptSHA is the SHA1 Redis uses to identify a cached script. SHA1 here is
+// Redis's addressing scheme, not a security choice.
+func scriptSHA(script string) string {
+	return fmt.Sprintf("%x", sha1.Sum([]byte(script))) // #nosec G401 - SHA1 is Redis's script cache key, not a security primitive
 }
 
 // Request checks if a job can run according to the limiter's rules.

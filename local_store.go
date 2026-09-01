@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// LocalStore is an in-memory implementation of Datastore.
+// LocalStore is an in-memory implementation of Datastore and LeaseDatastore.
 type LocalStore struct {
 	mu     sync.RWMutex
 	state  map[string]*LocalState
+	leases map[string]*localLeaseState
 	closed bool
 }
 
@@ -22,7 +23,8 @@ type LocalState struct {
 // NewLocalStore creates a new LocalStore instance.
 func NewLocalStore() *LocalStore {
 	return &LocalStore{
-		state: make(map[string]*LocalState),
+		state:  make(map[string]*LocalState),
+		leases: make(map[string]*localLeaseState),
 	}
 }
 
@@ -117,6 +119,7 @@ func (ls *LocalStore) Disconnect() error {
 
 	ls.closed = true
 	ls.state = nil
+	ls.leases = nil
 
 	return nil
 }

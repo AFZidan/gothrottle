@@ -23,7 +23,8 @@
 - **Configurable Limits**: Set maximum concurrent jobs and minimum time between jobs
 - **Priority Queue**: Jobs are executed by priority, FIFO within a priority
 - **Event-Driven Scheduler**: Dispatches as capacity frees up, with no idle polling
-- **Atomic Operations**: Redis operations use Lua scripts to prevent race conditions
+- **Atomic Operations**: Redis operations use Lua scripts, with the clock read from Redis so instances need not agree on time
+- **Renewable Leases**: Capacity is held by tokenized leases, so a long job keeps its slot and a crashed process releases it
 - **Easy Integration**: Simple API for wrapping existing functions
 
 ## Installation
@@ -128,6 +129,9 @@ type Options struct {
 
     // Cap on queued jobs; further submissions get ErrQueueFull (0 = unbounded)
     MaxQueueSize int
+
+    // How long a capacity reservation survives without renewal (default 30s)
+    LeaseTTL time.Duration
 
     // Receives errors that have no caller to return them to
     OnError func(error)
@@ -322,6 +326,35 @@ type Datastore interface {
     Disconnect() error
 }
 ```
+
+### Leases
+
+A shared counter cannot distinguish a slow job from a dead one. Expiring the
+counter is the only way to keep a crashed process from holding capacity forever,
+but expiring it while a job is still running lets another job start over the
+limit — and the finished job's late decrement can then corrupt the newcomer's
+state.
+
+`LeaseDatastore` tracks each reservation individually instead:
+
+```go
+type LeaseDatastore interface {
+    Datastore
+
+    Acquire(ctx context.Context, limiterID string, weight int, opts Options) (*Lease, time.Duration, error)
+    Renew(ctx context.Context, lease *Lease) error
+    Release(ctx context.Context, lease *Lease) error
+}
+```
+
+Every lease has a unique token and its own expiry. The limiter renews while a job
+runs, so a long job keeps its capacity; if the holder dies, renewal stops and the
+capacity is reclaimed within `LeaseTTL`. Because `Release` names one token, a late
+release from an expired job cannot disturb a newer lease.
+
+Both `LocalStore` and `RedisStore` implement this, and the limiter uses it
+automatically. The interface is additive: a custom `Datastore` that implements
+only `Request`/`RegisterDone` still works, on the older counter semantics.
 
 - **LocalStore**: Uses Go mutexes and in-memory state
 - **RedisStore**: Uses atomic Lua scripts for race-condition-free distributed coordination
