@@ -3,7 +3,6 @@ package gothrottle_test
 
 import (
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,8 +13,6 @@ import (
 // blockingStore is a Datastore whose Request can be held open, so a test can
 // interleave a Stop with an in-flight capacity request.
 type blockingStore struct {
-	mu sync.Mutex
-
 	// release gates Request; when non-nil, Request blocks until it is closed.
 	release chan struct{}
 	// entered is closed the first time Request blocks.
