@@ -16,14 +16,8 @@ type localLease struct {
 // LeaseDatastore with the same semantics as RedisStore, so switching between
 // local and distributed mode does not change observable behavior.
 func (ls *LocalStore) Acquire(_ context.Context, limiterID string, weight int, opts Options) (*Lease, time.Duration, error) {
-	if err := validateLimiterID(limiterID); err != nil {
+	if err := validateAdmission(limiterID, weight, opts); err != nil {
 		return nil, 0, err
-	}
-	if weight <= 0 {
-		return nil, 0, ErrInvalidWeight
-	}
-	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
-		return nil, 0, ErrWeightExceedsMax
 	}
 
 	token, err := newLeaseToken()
@@ -47,15 +41,8 @@ func (ls *LocalStore) Acquire(_ context.Context, limiterID string, weight int, o
 	if stored, ok := state.registeredConfig(now); ok && stored != config {
 		return nil, 0, configMismatchError(limiterID, config, stored, limiterID)
 	}
-
-	if opts.MaxConcurrent > 0 && state.runningWeight()+weight > opts.MaxConcurrent {
-		return nil, 0, nil
-	}
-
-	if opts.MinTime > 0 && !state.lastStart.IsZero() {
-		if elapsed := now.Sub(state.lastStart); elapsed < opts.MinTime {
-			return nil, opts.MinTime - elapsed, nil
-		}
+	if retryAfter, refused := state.refuse(now, weight, opts); refused {
+		return nil, retryAfter, nil
 	}
 
 	expiresAt := now.Add(ttl)
@@ -72,6 +59,21 @@ func (ls *LocalStore) Acquire(_ context.Context, limiterID string, weight int, o
 		TTL:       ttl,
 		ExpiresAt: expiresAt,
 	}, 0, nil
+}
+
+// refuse reports whether admission is blocked, and by how long when the block is
+// a spacing window with a known end. A concurrency refusal has no deadline: only
+// a release can end it, so retryAfter is zero.
+func (s *localLeaseState) refuse(now time.Time, weight int, opts Options) (retryAfter time.Duration, refused bool) {
+	if opts.MaxConcurrent > 0 && s.runningWeight()+weight > opts.MaxConcurrent {
+		return 0, true
+	}
+	if opts.MinTime > 0 && !s.lastStart.IsZero() {
+		if elapsed := now.Sub(s.lastStart); elapsed < opts.MinTime {
+			return opts.MinTime - elapsed, true
+		}
+	}
+	return 0, false
 }
 
 // Renew extends a lease. It implements LeaseDatastore.

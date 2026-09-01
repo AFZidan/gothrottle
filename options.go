@@ -146,6 +146,40 @@ func (o Options) reportError(err error) {
 	o.OnError(err)
 }
 
+// validateAdmission checks the preconditions shared by every admission call —
+// Request on the legacy path and Acquire on the lease path — so both store
+// implementations reject the same inputs.
+//
+// An empty limiter ID is not checked here: it is a problem for RedisStore, where
+// the ID becomes part of a key, and harmless for LocalStore, where it is just a
+// map key. RedisStore rejects it before calling this.
+func validateAdmission(limiterID string, weight int, opts Options) error {
+	if err := validateLimiterID(limiterID); err != nil {
+		return err
+	}
+	if weight <= 0 {
+		return ErrInvalidWeight
+	}
+	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
+		// Without this the job would be refused forever with no error,
+		// spinning in the scheduler's requeue loop.
+		return ErrWeightExceedsMax
+	}
+	return nil
+}
+
+// validateCompletion checks the preconditions shared by every RegisterDone call.
+// Like validateAdmission it leaves the empty-ID case to RedisStore.
+func validateCompletion(limiterID string, weight int) error {
+	if err := validateLimiterID(limiterID); err != nil {
+		return err
+	}
+	if weight <= 0 {
+		return ErrInvalidWeight
+	}
+	return nil
+}
+
 func validateLimiterID(id string) error {
 	if len(id) > maxLimiterIDLength {
 		return ErrInvalidID

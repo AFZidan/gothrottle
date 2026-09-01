@@ -26,7 +26,6 @@ func TestLegacyState_RegisterDoneKeepsLongTTL(t *testing.T) {
 	}
 	defer func() { _ = store.Disconnect() }()
 
-	ctx := context.Background()
 	id := uniqueLimiterID("legacy-ttl")
 	const minTime = 40 * time.Second
 	opts := gothrottle.Options{MinTime: minTime}
@@ -36,10 +35,7 @@ func TestLegacyState_RegisterDoneKeepsLongTTL(t *testing.T) {
 		t.Fatalf("Request = (%v, %v), want (true, nil)", canRun, err)
 	}
 
-	afterRequest, err := client.PTTL(ctx, key).Result()
-	if err != nil {
-		t.Fatalf("PTTL failed: %v", err)
-	}
+	afterRequest := pttl(t, client, key)
 	if afterRequest <= minTime {
 		t.Fatalf("state TTL after Request = %v, want longer than MinTime %v", afterRequest, minTime)
 	}
@@ -48,10 +44,7 @@ func TestLegacyState_RegisterDoneKeepsLongTTL(t *testing.T) {
 		t.Fatalf("RegisterDone failed: %v", err)
 	}
 
-	afterDone, err := client.PTTL(ctx, key).Result()
-	if err != nil {
-		t.Fatalf("PTTL failed: %v", err)
-	}
+	afterDone := pttl(t, client, key)
 	if afterDone <= minTime {
 		t.Fatalf("RegisterDone cut the state TTL to %v; the %v spacing window would expire with it", afterDone, minTime)
 	}
@@ -219,17 +212,13 @@ func TestLegacyState_RequestDoesNotShortenAnExistingWindow(t *testing.T) {
 	}
 	defer func() { _ = store.Disconnect() }()
 
-	ctx := context.Background()
 	id := uniqueLimiterID("legacy-ttl-monotonic")
 	key := gothrottle.RedisStateKey(id)
 
 	if canRun, _, err := store.Request(id, 1, gothrottle.Options{MinTime: 60 * time.Second}); err != nil || !canRun {
 		t.Fatalf("Request = (%v, %v), want (true, nil)", canRun, err)
 	}
-	long, err := client.PTTL(ctx, key).Result()
-	if err != nil {
-		t.Fatalf("PTTL failed: %v", err)
-	}
+	long := pttl(t, client, key)
 
 	// Refused by spacing, but the script still touches the key's TTL on the way
 	// out of a successful branch elsewhere; either way it must not shrink.
@@ -240,10 +229,7 @@ func TestLegacyState_RequestDoesNotShortenAnExistingWindow(t *testing.T) {
 		t.Fatalf("RegisterDone failed: %v", err)
 	}
 
-	after, err := client.PTTL(ctx, key).Result()
-	if err != nil {
-		t.Fatalf("PTTL failed: %v", err)
-	}
+	after := pttl(t, client, key)
 	// Allow for the time the test itself took.
 	if after < long-5*time.Second {
 		t.Fatalf("state TTL fell from %v to %v; a shorter MinTime shortened another caller's window", long, after)

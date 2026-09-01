@@ -64,3 +64,26 @@ var testIDCounter uint64
 func uniqueLimiterID(prefix string) string {
 	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), atomic.AddUint64(&testIDCounter, 1))
 }
+
+// pttl reads a key's remaining TTL, failing the test if the key is missing or
+// has no expiry. Several tests assert on TTLs rather than outwaiting a long
+// window, and "no expiry" and "no key" are results they must never accept
+// silently — go-redis reports Redis's -1 and -2 as those durations.
+func pttl(t *testing.T, client *redis.Client, key string) time.Duration {
+	t.Helper()
+
+	ttl, err := client.PTTL(context.Background(), key).Result()
+	if err != nil {
+		t.Fatalf("PTTL(%s) failed: %v", key, err)
+	}
+	switch ttl {
+	case -2:
+		t.Fatalf("key %s does not exist", key)
+	case -1:
+		t.Fatalf("key %s has no expiry", key)
+	}
+	if ttl <= 0 {
+		t.Fatalf("PTTL(%s) = %v, want a positive TTL", key, ttl)
+	}
+	return ttl
+}
