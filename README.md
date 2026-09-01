@@ -8,7 +8,7 @@
   <a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/AFZidan/gothrottle" alt="Go Version"></a>
   <a href="https://github.com/AFZidan/gothrottle/actions"><img src="https://github.com/AFZidan/gothrottle/workflows/CI/CD%20Pipeline/badge.svg" alt="Build Status"></a>
   <a href="https://goreportcard.com/report/github.com/AFZidan/gothrottle"><img src="https://goreportcard.com/badge/github.com/AFZidan/gothrottle" alt="Go Report Card"></a>
-  <a href="https://coveralls.io/github/AFZidan/gothrottle?branch=main"><img src="https://coveralls.io/repos/github/AFZidan/gothrottle/badge.svg?branch=main" alt="Coverage Status"></a>
+  <a href="https://codecov.io/gh/AFZidan/gothrottle"><img src="https://codecov.io/gh/AFZidan/gothrottle/branch/main/graph/badge.svg" alt="Coverage Status"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   <a href="https://godoc.org/github.com/AFZidan/gothrottle"><img src="https://godoc.org/github.com/AFZidan/gothrottle?status.svg" alt="GoDoc"></a>
 </p>

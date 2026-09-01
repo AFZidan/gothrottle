@@ -93,18 +93,60 @@ jobs:
           exit 1
         fi
 
+    - name: Wait for Redis
+      shell: bash
+      run: |
+        # The service container is already health-checked, but verify the
+        # mapped port answers from the job so a silent Redis failure surfaces
+        # here rather than as a skipped test.
+        for i in $(seq 1 30); do
+          if (exec 3<>/dev/tcp/localhost/6379) 2>/dev/null; then
+            echo "✓ Redis is reachable on localhost:6379"
+            exit 0
+          fi
+          echo "Waiting for Redis... ($i/30)"
+          sleep 1
+        done
+        echo "ERROR: Redis did not become reachable at localhost:6379"
+        exit 1
+
     - name: Run tests
-      run: go test -v -race -coverprofile=coverage.out -coverpkg=./... ./tests/...
+      # shell: bash sets -o pipefail so a test failure is not masked by tee.
+      shell: bash
+      env:
+        REDIS_ADDR: localhost:6379
+        REQUIRE_REDIS: "true"
+      run: go test -v -race -coverprofile=coverage.out -coverpkg=./... ./tests/... 2>&1 | tee test-output.txt
+
+    - name: Fail if Redis tests skipped
+      shell: bash
+      run: |
+        if grep -qE '^\s*--- SKIP: TestRedis' test-output.txt; then
+          echo "ERROR: Redis integration tests were skipped even though Redis was required:"
+          grep -E '^\s*--- SKIP: TestRedis' test-output.txt
+          exit 1
+        fi
+        redis_tests=$(grep -cE '^\s*--- PASS: TestRedis' test-output.txt || true)
+        if [ "$redis_tests" -lt 1 ]; then
+          echo "ERROR: no Redis integration tests reported PASS; Redis coverage is missing"
+          grep -E 'TestRedis' test-output.txt || echo "(no TestRedis output at all)"
+          exit 1
+        fi
+        echo "✓ $redis_tests Redis integration test(s) executed against Redis ${{ matrix.redis-version }}"
 
     - name: Run benchmarks
-      run: go test -bench=. -benchmem ./tests/...
+      env:
+        REDIS_ADDR: localhost:6379
+        REQUIRE_REDIS: "true"
+      run: go test -bench=. -benchmem -run '^$' ./tests/...
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v4
       with:
-        file: ./coverage.out
+        files: ./coverage.out
         flags: unittests
         name: codecov-umbrella
+      continue-on-error: true
 
   lint:
     name: Lint
@@ -143,9 +185,11 @@ jobs:
           ${{ runner.os }}-go-
 
     - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v3
+      uses: golangci/golangci-lint-action@v6
       with:
-        version: latest
+        # Pinned deliberately: `latest` makes CI results depend on when it ran,
+        # so a new linter release can break an unchanged commit.
+        version: v1.59.1
         args: --timeout=5m
 
   security:
@@ -185,8 +229,11 @@ jobs:
           ${{ runner.os }}-go-
 
     - name: Run Gosec Security Scanner
+      env:
+        # Pinned deliberately: see the golangci-lint note in the lint job.
+        GOSEC_VERSION: v2.20.0
       run: |
-        go install github.com/securego/gosec/v2/cmd/gosec@latest
+        go install github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}
         gosec ./...
 
   build:

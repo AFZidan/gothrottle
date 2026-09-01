@@ -5,13 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/AFZidan/gothrottle"
-	"github.com/go-redis/redis/v8"
 )
 
 // TestIntegration demonstrates the full workflow
@@ -171,12 +169,8 @@ func TestRedisStore_NilClient(t *testing.T) {
 }
 
 func TestRedisStore_ClosedClientBehavior(t *testing.T) {
-	addr := os.Getenv("REDIS_ADDR")
-	if addr == "" {
-		t.Skip("REDIS_ADDR not set")
-	}
+	client := newTestRedisClient(t)
 
-	client := redis.NewClient(&redis.Options{Addr: addr})
 	store, err := gothrottle.NewRedisStore(client)
 	if err != nil {
 		t.Fatalf("NewRedisStore failed: %v", err)
@@ -196,12 +190,8 @@ func TestRedisStore_ClosedClientBehavior(t *testing.T) {
 }
 
 func TestRedisStore_ReloadsMissingScript(t *testing.T) {
-	addr := os.Getenv("REDIS_ADDR")
-	if addr == "" {
-		t.Skip("REDIS_ADDR not set")
-	}
+	client := newTestRedisClient(t)
 
-	client := redis.NewClient(&redis.Options{Addr: addr})
 	store, err := gothrottle.NewRedisStore(client)
 	if err != nil {
 		t.Fatalf("NewRedisStore failed: %v", err)
@@ -212,7 +202,7 @@ func TestRedisStore_ReloadsMissingScript(t *testing.T) {
 		t.Fatalf("ScriptFlush failed: %v", err)
 	}
 
-	canRun, _, err := store.Request("reload-script", 1, gothrottle.Options{MaxConcurrent: 1})
+	canRun, _, err := store.Request(uniqueLimiterID("reload-script"), 1, gothrottle.Options{MaxConcurrent: 1})
 	if err != nil {
 		t.Fatalf("Request after ScriptFlush failed: %v", err)
 	}
@@ -222,23 +212,21 @@ func TestRedisStore_ReloadsMissingScript(t *testing.T) {
 }
 
 func TestRedisStore_RegisterDoneDoesNotUnderflow(t *testing.T) {
-	addr := os.Getenv("REDIS_ADDR")
-	if addr == "" {
-		t.Skip("REDIS_ADDR not set")
-	}
+	client := newTestRedisClient(t)
 
-	client := redis.NewClient(&redis.Options{Addr: addr})
 	store, err := gothrottle.NewRedisStore(client)
 	if err != nil {
 		t.Fatalf("NewRedisStore failed: %v", err)
 	}
 	defer func() { _ = store.Disconnect() }()
 
-	if err := store.RegisterDone("underflow", 1); err != nil {
+	id := uniqueLimiterID("underflow")
+
+	if err := store.RegisterDone(id, 1); err != nil {
 		t.Fatalf("RegisterDone failed: %v", err)
 	}
 
-	canRun, _, err := store.Request("underflow", 1, gothrottle.Options{MaxConcurrent: 1})
+	canRun, _, err := store.Request(id, 1, gothrottle.Options{MaxConcurrent: 1})
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}

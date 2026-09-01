@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   redis:
     image: redis:7-alpine
@@ -21,7 +19,13 @@ services:
         condition: service_healthy
     environment:
       - REDIS_ADDR=redis:6379
+      # Fail rather than skip if Redis is unreachable from the container.
+      - REQUIRE_REDIS=true
     volumes:
       - .:/app
+      - go-build-cache:/root/.cache/go-build
     working_dir: /app
     command: make ci
+
+volumes:
+  go-build-cache:

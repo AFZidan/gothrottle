@@ -1,7 +1,7 @@
 # GoThrottle Makefile
 # Common development commands for the GoThrottle rate limiting library
 
-.PHONY: help build test test-race test-cover test-bench clean fmt lint vet security deps verify install cross-build docker-test coverage-html coverage-check mod-tidy
+.PHONY: help build test test-race test-cover test-bench clean fmt lint vet security deps verify install cross-build docker-test docker-test-down redis-up redis-down test-redis coverage-html coverage-check mod-tidy
 
 # Default target
 .DEFAULT_GOAL := help
@@ -14,6 +14,17 @@ GOARCH := $(shell go env GOARCH)
 COVERAGE_OUT := coverage.out
 COVERAGE_HTML := coverage.html
 MIN_COVERAGE := 60
+
+# Tool versions - keep in sync with .github/workflows/ci.yml and Dockerfile.test
+GOLANGCI_LINT_VERSION := v1.59.1
+GOSEC_VERSION := v2.20.0
+
+# Prefer the Compose v2 plugin, fall back to the standalone v1 binary
+COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi)
+COMPOSE_FILE := docker-compose.test.yml
+
+# Address used by Redis-backed integration tests
+REDIS_ADDR ?= localhost:6379
 
 # Colors for output
 RED := \033[0;31m
@@ -70,7 +81,12 @@ test-cover: ## Run tests with coverage
 
 test-bench: ## Run benchmarks
 	@echo "$(BLUE)Running benchmarks...$(NC)"
-	go test -bench=. -benchmem ./tests/...
+	go test -bench=. -benchmem -run '^$$' ./tests/...
+
+test-redis: redis-up ## Run tests against a local Redis (starts one via Docker)
+	@echo "$(BLUE)Running tests with Redis at $(REDIS_ADDR)...$(NC)"
+	REDIS_ADDR=$(REDIS_ADDR) REQUIRE_REDIS=true go test -v -race ./tests/...
+	@echo "$(GREEN)✓ Redis-backed tests passed$(NC)"
 
 test-all: test-race test-cover test-bench ## Run all tests (race, coverage, benchmarks)
 
@@ -162,19 +178,33 @@ mod-update: ## Update dependencies to latest versions
 	@echo "$(GREEN)✓ Dependencies updated$(NC)"
 
 # Tool installation
-install-tools: ## Install development tools
+install-tools: ## Install development tools (pinned versions)
 	@echo "$(BLUE)Installing development tools...$(NC)"
-	@echo "$(YELLOW)Installing golangci-lint...$(NC)"
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-	@echo "$(YELLOW)Installing gosec...$(NC)"
-	go install github.com/securego/gosec/v2/cmd/gosec@latest
+	@echo "$(YELLOW)Installing golangci-lint $(GOLANGCI_LINT_VERSION)...$(NC)"
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	@echo "$(YELLOW)Installing gosec $(GOSEC_VERSION)...$(NC)"
+	go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)
 	@echo "$(GREEN)✓ Development tools installed$(NC)"
 
 # Docker commands
-docker-test: ## Run tests in Docker with Redis
+redis-up: ## Start a local Redis container for integration tests
+	@echo "$(BLUE)Starting Redis...$(NC)"
+	$(COMPOSE) -f $(COMPOSE_FILE) up -d --wait redis
+	@echo "$(GREEN)✓ Redis running at $(REDIS_ADDR)$(NC)"
+
+redis-down: ## Stop the local Redis container
+	@echo "$(BLUE)Stopping Redis...$(NC)"
+	$(COMPOSE) -f $(COMPOSE_FILE) down
+
+docker-test: ## Run the full quality gate in Docker with Redis
 	@echo "$(BLUE)Running tests in Docker with Redis...$(NC)"
-	docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test
-	docker-compose -f docker-compose.test.yml down
+	$(COMPOSE) -f $(COMPOSE_FILE) up --build --abort-on-container-exit --exit-code-from test; \
+	status=$$?; \
+	$(COMPOSE) -f $(COMPOSE_FILE) down --volumes --remove-orphans; \
+	exit $$status
+
+docker-test-down: ## Tear down the Docker test environment
+	$(COMPOSE) -f $(COMPOSE_FILE) down --volumes --remove-orphans
 
 # CI simulation
 ci: deps verify quality test-all cross-build ## Simulate CI pipeline locally
