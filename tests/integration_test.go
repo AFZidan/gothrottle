@@ -206,7 +206,7 @@ func TestRedisStore_ReloadsMissingScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRedisStore failed: %v", err)
 	}
-	defer store.Disconnect()
+	defer func() { _ = store.Disconnect() }()
 
 	if err := client.ScriptFlush(context.Background()).Err(); err != nil {
 		t.Fatalf("ScriptFlush failed: %v", err)
@@ -232,7 +232,7 @@ func TestRedisStore_RegisterDoneDoesNotUnderflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRedisStore failed: %v", err)
 	}
-	defer store.Disconnect()
+	defer func() { _ = store.Disconnect() }()
 
 	if err := store.RegisterDone("underflow", 1); err != nil {
 		t.Fatalf("RegisterDone failed: %v", err)
