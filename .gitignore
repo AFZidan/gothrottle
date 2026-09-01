@@ -10,6 +10,9 @@
 
 # Test binary, built with `go test -c`
 *.test
+# ...but Dockerfile.test is source, not a binary (this pattern is why it was
+# missing from the repository and `make docker-test` was broken).
+!Dockerfile.test
 
 # Code coverage profiles and other test artifacts
 *.out
@@ -35,3 +38,12 @@ go.work.sum
 *.tmp
 .vscode/specs
 /specs
+
+# Agent/tooling scratch directories
+.zcode/
+
+# CI test log captured for the Redis skip guard
+test-output.txt
+
+# SQLite artifacts created by the database examples
+example.db

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1" // #nosec G505 - SHA1 is used for Redis script hashing, not cryptographic security
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -12,9 +13,14 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-// RedisStore is a Redis-based implementation of Datastore.
+// defaultStateTTL bounds how long shared counter state survives without
+// updates, so a process that dies mid-job does not leak its reservation
+// forever.
+const defaultStateTTL = 30 * time.Second
+
+// RedisStore is a Redis-based implementation of Datastore and LeaseDatastore.
 type RedisStore struct {
-	client     *redis.Client
+	client     redis.UniversalClient
 	scriptSHA  string
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -22,9 +28,14 @@ type RedisStore struct {
 }
 
 // NewRedisStore creates a new RedisStore instance.
-func NewRedisStore(client *redis.Client) (*RedisStore, error) {
-	if client == nil {
-		return nil, ErrStoreClosed
+//
+// The parameter is go-redis's UniversalClient, which *redis.Client satisfies, so
+// existing call sites are unchanged. *redis.ClusterClient and *redis.Ring
+// satisfy it too; see the package documentation on Redis Cluster for what is and
+// is not supported there.
+func NewRedisStore(client redis.UniversalClient) (*RedisStore, error) {
+	if isNilClient(client) {
+		return nil, ErrNilClient
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -44,13 +55,43 @@ func NewRedisStore(client *redis.Client) (*RedisStore, error) {
 	return rs, nil
 }
 
-// The Lua script MUST be this exact script:
-const redisScript = `
+// isNilClient reports whether a client value is unusable. A nil interface and a
+// typed nil pointer stored in one — NewRedisStore((*redis.Client)(nil)) — are
+// both rejected here, because a typed nil is non-nil as an interface and would
+// otherwise panic on first use.
+func isNilClient(client redis.UniversalClient) bool {
+	if client == nil {
+		return true
+	}
+	value := reflect.ValueOf(client)
+	switch value.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface, reflect.UnsafePointer:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+// redisScript admits or refuses a job atomically.
+//
+// Time comes from Redis TIME rather than the calling process's clock, so a
+// machine with a skewed clock cannot admit work early or impose an inflated
+// wait on everyone else. Durations are microseconds, because MinTime is a
+// time.Duration and truncating to whole milliseconds silently dropped
+// sub-millisecond spacing that LocalStore honored.
+//
+// This is the legacy counter path, kept for Datastore implementations and
+// callers that use Request/RegisterDone directly. It cannot tell a slow holder
+// from a dead one; the lease path is what the limiter uses.
+const redisScript = stateTTLHelper + `
 local key = KEYS[1]
 local max_concurrent = tonumber(ARGV[1])
-local min_time_ms = tonumber(ARGV[2])
+local min_time_us = tonumber(ARGV[2])
 local weight = tonumber(ARGV[3])
-local current_time_ms = tonumber(ARGV[4])
+local ttl_ms = tonumber(ARGV[4])
+
+local time = redis.call("TIME")
+local now_us = (tonumber(time[1]) * 1000000) + tonumber(time[2])
 
 local state = redis.call("HGETALL", key)
 local running = 0
@@ -59,7 +100,7 @@ local last_start = 0
 for i = 1, #state, 2 do
     if state[i] == "running" then
         running = tonumber(state[i+1])
-    elseif state[i] == "last_start" then
+    elseif state[i] == "last_start_us" then
         last_start = tonumber(state[i+1])
     end
 end
@@ -68,17 +109,38 @@ if max_concurrent > 0 and running + weight > max_concurrent then
     return {0, -1}
 end
 
-local elapsed = current_time_ms - last_start
-if min_time_ms > 0 and elapsed < min_time_ms then
-    local wait = min_time_ms - elapsed
-    return {0, wait}
+if min_time_us > 0 and last_start > 0 then
+    local elapsed = now_us - last_start
+    if elapsed < min_time_us then
+        return {0, min_time_us - elapsed}
+    end
 end
 
 redis.call("HINCRBY", key, "running", weight)
-redis.call("HSET", key, "last_start", current_time_ms)
-redis.call("PEXPIRE", key, 30000)
+redis.call("HSET", key, "last_start_us", now_us)
+ensure_state_ttl(key, ttl_ms)
 
 return {1, 0}
+`
+
+// stateTTLHelper keeps the legacy state key's expiry monotonic. Request sizes
+// the TTL to cover the spacing window, and RegisterDone knows nothing about
+// MinTime, so a completion that reset the TTL to its own default expired state
+// that was still protecting an active window — a 40s MinTime lost its spacing
+// after 30s. Neither script may now shorten an existing expiry.
+const stateTTLHelper = `
+local function ensure_state_ttl(key, ttl_ms)
+    if ttl_ms <= 0 then
+        return
+    end
+    local current = redis.call("PTTL", key)
+    if current == -2 then
+        return
+    end
+    if current == -1 or current < ttl_ms then
+        redis.call("PEXPIRE", key, ttl_ms)
+    end
+end
 `
 
 // loadScript loads the Lua script into Redis and stores its SHA.
@@ -94,7 +156,7 @@ func (rs *RedisStore) loadScriptLocked() error {
 		return ErrStoreClosed
 	}
 
-	sha := fmt.Sprintf("%x", sha1.Sum([]byte(redisScript))) // #nosec G401 - SHA1 is used for Redis script hashing, not cryptographic security
+	sha := scriptSHA(redisScript)
 
 	// Check if script already exists
 	exists, err := rs.client.ScriptExists(rs.ctx, sha).Result()
@@ -117,6 +179,12 @@ func (rs *RedisStore) loadScriptLocked() error {
 	return nil
 }
 
+// scriptSHA is the SHA1 Redis uses to identify a cached script. SHA1 here is
+// Redis's addressing scheme, not a security choice.
+func scriptSHA(script string) string {
+	return fmt.Sprintf("%x", sha1.Sum([]byte(script))) // #nosec G401 - SHA1 is Redis's script cache key, not a security primitive
+}
+
 // Request checks if a job can run according to the limiter's rules.
 func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRun bool, waitTime time.Duration, err error) {
 	if limiterID == "" {
@@ -132,46 +200,16 @@ func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRu
 		return false, 0, ErrWeightExceedsMax
 	}
 
-	rs.mu.RLock()
-	client := rs.client
-	ctx := rs.ctx
-	sha := rs.scriptSHA
-	rs.mu.RUnlock()
-	if client == nil {
-		return false, 0, ErrStoreClosed
-	}
-
-	key := fmt.Sprintf("gothrottle:%s", limiterID)
-	currentTimeMs := time.Now().UnixMilli()
-
-	result, err := client.EvalSha(ctx, sha, []string{key},
+	args := []interface{}{
 		opts.MaxConcurrent,
-		opts.MinTime.Milliseconds(),
+		opts.MinTime.Microseconds(),
 		weight,
-		currentTimeMs,
-	).Result()
-	if isRedisNoScript(err) {
-		if loadErr := rs.loadScript(); loadErr != nil {
-			return false, 0, fmt.Errorf("redis script reload error: %w", loadErr)
-		}
-		rs.mu.RLock()
-		client = rs.client
-		ctx = rs.ctx
-		sha = rs.scriptSHA
-		rs.mu.RUnlock()
-		if client == nil {
-			return false, 0, ErrStoreClosed
-		}
-		result, err = client.EvalSha(ctx, sha, []string{key},
-			opts.MaxConcurrent,
-			opts.MinTime.Milliseconds(),
-			weight,
-			currentTimeMs,
-		).Result()
+		rs.stateTTL(opts).Milliseconds(),
 	}
 
+	result, err := rs.evalScript(limiterID, args)
 	if err != nil {
-		return false, 0, fmt.Errorf("redis eval error: %w", err)
+		return false, 0, err
 	}
 
 	resultSlice, ok := result.([]interface{})
@@ -192,10 +230,67 @@ func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRu
 	canRun = canRunInt == 1
 	waitTime = 0 // Default to no wait
 	if waitTimeInt > 0 {
-		waitTime = time.Duration(waitTimeInt) * time.Millisecond
+		waitTime = time.Duration(waitTimeInt) * time.Microsecond
 	}
 
 	return canRun, waitTime, nil
+}
+
+// evalScript runs the admission script, falling back to EVAL if Redis has
+// forgotten it (NOSCRIPT), for example after a SCRIPT FLUSH or a failover. EVAL
+// executes and caches the script on the node that serves it, so the fallback
+// also covers a Cluster or Ring client where SCRIPT LOAD reached a different
+// node than the one holding the key.
+func (rs *RedisStore) evalScript(limiterID string, args []interface{}) (interface{}, error) {
+	keys := []string{stateKey(limiterID)}
+
+	rs.mu.RLock()
+	client := rs.client
+	ctx := rs.ctx
+	sha := rs.scriptSHA
+	rs.mu.RUnlock()
+	if client == nil {
+		return nil, ErrStoreClosed
+	}
+
+	result, err := client.EvalSha(ctx, sha, keys, args...).Result()
+	if isRedisNoScript(err) {
+		result, err = client.Eval(ctx, redisScript, keys, args...).Result()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redis eval error: %w", err)
+	}
+
+	return result, nil
+}
+
+// stateTTL is how long the shared counter survives without updates. It is a
+// safety net against a process dying mid-job and leaking its reservation, so it
+// must outlast the spacing window: a MinTime longer than the TTL would
+// otherwise be bypassed entirely once the key expired.
+//
+// This does not fix the underlying flaw — a job that runs longer than the TTL
+// still has its state expire while it is running, which is what tokenized
+// leases address.
+func (rs *RedisStore) stateTTL(opts Options) time.Duration {
+	ttl := defaultStateTTL
+	if minimum := 2 * opts.MinTime; minimum > ttl {
+		ttl = minimum
+	}
+	return ttl
+}
+
+// stateKey is the legacy counter key for a limiter ID. It is a single key, so it
+// needs no hash tag: the legacy script is single-key and routes to whatever slot
+// the ID hashes to.
+func stateKey(limiterID string) string {
+	return fmt.Sprintf("gothrottle:%s", limiterID)
+}
+
+// RedisStateKey returns the key the legacy Request/RegisterDone path uses for a
+// limiter ID. Like RedisKeys it is exported for operational inspection.
+func RedisStateKey(limiterID string) string {
+	return stateKey(limiterID)
 }
 
 // RegisterDone informs the store that a job has finished.
@@ -218,9 +313,10 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 		return ErrStoreClosed
 	}
 
-	key := fmt.Sprintf("gothrottle:%s", limiterID)
-
-	err := client.Eval(ctx, redisRegisterDoneScript, []string{key}, weight).Err()
+	err := client.Eval(ctx, redisRegisterDoneScript, []string{stateKey(limiterID)},
+		weight,
+		defaultStateTTL.Milliseconds(),
+	).Err()
 	if err != nil {
 		return fmt.Errorf("redis register done error: %w", err)
 	}
@@ -228,7 +324,10 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 	return nil
 }
 
-// Disconnect cleans up any connections.
+// Disconnect releases this store's resources. The *redis.Client passed to
+// NewRedisStore was created by the caller and stays open: other stores,
+// limiters or application components may still be using it. Callers close the
+// client themselves when they are done with it.
 func (rs *RedisStore) Disconnect() error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -238,25 +337,54 @@ func (rs *RedisStore) Disconnect() error {
 		rs.cancelFunc = nil
 	}
 
-	if rs.client != nil {
-		err := rs.client.Close()
-		rs.client = nil
-		return err
+	// Dropping the reference marks the store closed; subsequent calls return
+	// ErrStoreClosed.
+	rs.client = nil
+
+	return nil
+}
+
+// Close disconnects the store and additionally closes the underlying
+// *redis.Client. Use it only when this store is the sole owner of the client;
+// Disconnect leaves the client open for other users.
+func (rs *RedisStore) Close() error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if rs.cancelFunc != nil {
+		rs.cancelFunc()
+		rs.cancelFunc = nil
+	}
+
+	client := rs.client
+	rs.client = nil
+	if client != nil {
+		return client.Close()
 	}
 
 	return nil
 }
 
-const redisRegisterDoneScript = `
+// redisRegisterDoneScript records a completion on the legacy counter.
+//
+// It never shortens the key's expiry. Request sizes the TTL to outlast the
+// spacing window, and this script has no idea what MinTime is, so resetting the
+// TTL to its own fallback used to expire state that was still enforcing a
+// window: a 40s MinTime got an ~80s TTL on Request and a 30s TTL here, so
+// spacing silently stopped after 30s. The fallback now applies only when the key
+// has no usable expiry of its own, and last_start_us is left untouched either
+// way.
+const redisRegisterDoneScript = stateTTLHelper + `
 local key = KEYS[1]
 local weight = tonumber(ARGV[1])
+local ttl_ms = tonumber(ARGV[2])
 local running = tonumber(redis.call("HGET", key, "running") or "0")
 running = running - weight
 if running < 0 then
     running = 0
 end
 redis.call("HSET", key, "running", running)
-redis.call("PEXPIRE", key, 30000)
+ensure_state_ttl(key, ttl_ms)
 return running
 `
 

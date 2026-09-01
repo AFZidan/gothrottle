@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// LocalStore is an in-memory implementation of Datastore.
+// LocalStore is an in-memory implementation of Datastore and LeaseDatastore.
 type LocalStore struct {
 	mu     sync.RWMutex
 	state  map[string]*LocalState
+	leases map[string]*localLeaseState
 	closed bool
 }
 
@@ -22,14 +23,25 @@ type LocalState struct {
 // NewLocalStore creates a new LocalStore instance.
 func NewLocalStore() *LocalStore {
 	return &LocalStore{
-		state: make(map[string]*LocalState),
+		state:  make(map[string]*LocalState),
+		leases: make(map[string]*localLeaseState),
 	}
 }
 
 // Request checks if a job can run according to the limiter's rules.
 func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRun bool, waitTime time.Duration, err error) {
+	// Validated on the same terms as RedisStore so both implementations of the
+	// interface reject the same inputs.
+	if err := validateLimiterID(limiterID); err != nil {
+		return false, 0, err
+	}
 	if weight <= 0 {
 		return false, 0, ErrInvalidWeight
+	}
+	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
+		// Without this the job would be refused forever with canRun=false and
+		// no error, spinning in the scheduler's requeue loop.
+		return false, 0, ErrWeightExceedsMax
 	}
 
 	ls.mu.Lock()
@@ -73,6 +85,9 @@ func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRu
 
 // RegisterDone informs the store that a job has finished.
 func (ls *LocalStore) RegisterDone(limiterID string, weight int) error {
+	if err := validateLimiterID(limiterID); err != nil {
+		return err
+	}
 	if weight <= 0 {
 		return ErrInvalidWeight
 	}
@@ -104,6 +119,7 @@ func (ls *LocalStore) Disconnect() error {
 
 	ls.closed = true
 	ls.state = nil
+	ls.leases = nil
 
 	return nil
 }
