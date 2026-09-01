@@ -19,6 +19,11 @@ const defaultRetryInterval = 10 * time.Millisecond
 // leaks capacity until the store's own expiry reclaims it.
 const defaultRegisterDoneAttempts = 3
 
+// minReleaseBudget floors how long a worker may spend handing capacity back. The
+// budget scales with LeaseTTL — beyond it the store reclaims the lease anyway —
+// but a 1s lease TTL must still leave room for a retry on a slow network.
+const minReleaseBudget = 5 * time.Second
+
 // SchedPolicy selects what the scheduler does when the highest priority queued
 // job does not fit in the currently available capacity.
 type SchedPolicy int
@@ -118,6 +123,19 @@ func (o Options) retryInterval() time.Duration {
 		return o.RetryInterval
 	}
 	return defaultRetryInterval
+}
+
+// releaseBudget bounds the total time a worker spends handing its capacity back,
+// including retries. Shutdown must not cancel a release — the whole point is to
+// return the reservation — so it needs a deadline of its own to keep a wedged
+// store from blocking Stop forever. Past the lease TTL there is nothing left to
+// return: the store reclaims the lease itself.
+func (o Options) releaseBudget() time.Duration {
+	budget := o.leaseTTL()
+	if budget < minReleaseBudget {
+		budget = minReleaseBudget
+	}
+	return budget
 }
 
 // reportError hands an error with no caller to Options.OnError, if one is set.

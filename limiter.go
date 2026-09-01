@@ -60,6 +60,14 @@ type Limiter struct {
 	stopOnce  sync.Once
 	stopErr   error
 
+	// opCtx is cancelled when Stop begins. It is what the limiter passes to
+	// LeaseDatastore calls that acquire capacity, so a store blocking on a
+	// network round trip cannot outlive shutdown. Releases deliberately do not
+	// use it: handing capacity back has to succeed *because* we are shutting
+	// down, so it gets its own bounded context.
+	opCtx    context.Context
+	opCancel context.CancelFunc
+
 	wg       sync.WaitGroup
 	workerWG sync.WaitGroup
 }
@@ -96,6 +104,7 @@ func NewLimiter(opts Options) (*Limiter, error) {
 		stopCh:        make(chan struct{}),
 		stoppedCh:     make(chan struct{}),
 	}
+	limiter.opCtx, limiter.opCancel = context.WithCancel(context.Background())
 	if leaseStore, ok := datastore.(LeaseDatastore); ok {
 		limiter.leaseStore = leaseStore
 	}
@@ -257,6 +266,12 @@ func (l *Limiter) start() {
 // finish. It is safe to call concurrently and repeatedly: every caller blocks
 // until shutdown has completed and receives the same error.
 //
+// Shutdown cancels the context the limiter passes to a LeaseDatastore, so a
+// store blocked inside Acquire or Renew is unblocked rather than holding Stop
+// open. Releases are exempt and get a bounded context of their own: capacity
+// still has to be handed back. A legacy Datastore takes no context, so its
+// Request and RegisterDone calls can only be waited out.
+//
 // The datastore is only disconnected if the limiter owns it (see
 // Options.CloseDatastoreOnStop). An injected datastore stays usable so that
 // other limiters, or other parts of the application sharing the same Redis
@@ -270,6 +285,11 @@ func (l *Limiter) Stop() error {
 		l.running = false
 		close(l.stopCh)
 		l.mu.Unlock()
+
+		// Unblock any datastore call that is waiting on the limiter's context.
+		// Without this a store blocked in Acquire would keep the scheduler, and
+		// therefore Stop, waiting indefinitely.
+		l.opCancel()
 
 		// Wait for the scheduler to finish (it cancels queued jobs on its way
 		// out), then for every worker so their RegisterDone calls land before
@@ -353,6 +373,13 @@ func (l *Limiter) dispatch() time.Duration {
 
 		granted, waitTime, err := l.acquireCapacity(job)
 		if err != nil {
+			// A cancellation caused by our own shutdown is not a datastore
+			// failure: the caller's job will never run, so it gets the same
+			// terminal error as everything else in the queue.
+			if l.shutdownCancelled(err) {
+				l.failJob(job, ErrStoreClosed)
+				return 0
+			}
 			// The claimed job is not requeued: its caller is unblocked with the
 			// error and decides whether to retry. Back off before touching the
 			// datastore again so one outage does not fail the whole queue in a
@@ -395,13 +422,17 @@ func (l *Limiter) dispatch() time.Duration {
 // acquireCapacity reserves capacity for a job. With a LeaseDatastore the
 // resulting lease is attached to the job, so its release later targets that one
 // reservation rather than decrementing a shared counter.
+//
+// The lease call receives the limiter's operation context, so a store that
+// blocks observes shutdown. The legacy path takes no context and can only be
+// waited out.
 func (l *Limiter) acquireCapacity(job *Job) (granted bool, retryAfter time.Duration, err error) {
 	if l.leaseStore == nil {
 		canRun, waitTime, err := l.datastore.Request(l.opts.ID, job.Weight, l.opts)
 		return canRun, waitTime, err
 	}
 
-	lease, retryAfter, err := l.leaseStore.Acquire(context.Background(), l.opts.ID, job.Weight, l.opts)
+	lease, retryAfter, err := l.leaseStore.Acquire(l.opCtx, l.opts.ID, job.Weight, l.opts)
 	if err != nil {
 		return false, 0, err
 	}
@@ -411,6 +442,19 @@ func (l *Limiter) acquireCapacity(job *Job) (granted bool, retryAfter time.Durat
 
 	job.lease = lease
 	return true, 0, nil
+}
+
+// shutdownCancelled reports whether an error is this limiter's own shutdown
+// cancelling a datastore call, rather than a failure of the store. A store may
+// return ctx.Err() directly or wrap it, so both are recognized.
+func (l *Limiter) shutdownCancelled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if l.opCtx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // claimNextJob removes the next dispatchable job from the queue. It returns nil
@@ -533,12 +577,19 @@ func (l *Limiter) executeJob(job *Job) {
 
 // startRenewal keeps a job's lease alive for as long as it runs and returns a
 // function that stops the renewal. With no lease store it is a no-op.
+//
+// The returned function cancels an in-flight renewal before waiting for the
+// goroutine, so a store blocked inside Renew cannot hold up job completion or
+// shutdown.
 func (l *Limiter) startRenewal(job *Job) func() {
 	if l.leaseStore == nil || job.lease == nil {
 		return func() {}
 	}
 
-	done := make(chan struct{})
+	// Derived from the limiter's operation context so shutdown cancels renewal
+	// too, and cancellable on its own so a finished job stops renewing
+	// immediately even while the limiter keeps running.
+	renewCtx, cancelRenew := context.WithCancel(l.opCtx)
 	stopped := make(chan struct{})
 
 	go func() {
@@ -549,14 +600,14 @@ func (l *Limiter) startRenewal(job *Job) func() {
 
 		for {
 			select {
-			case <-done:
+			case <-renewCtx.Done():
 				return
 			case <-ticker.C:
-				err := l.leaseStore.Renew(context.Background(), job.lease)
+				err := l.leaseStore.Renew(renewCtx, job.lease)
 				if err == nil {
 					continue
 				}
-				if errors.Is(err, ErrStoreClosed) {
+				if errors.Is(err, ErrStoreClosed) || renewCtx.Err() != nil {
 					return
 				}
 				// A lost lease means the store handed this capacity to someone
@@ -571,7 +622,7 @@ func (l *Limiter) startRenewal(job *Job) func() {
 	}()
 
 	return func() {
-		close(done)
+		cancelRenew()
 		<-stopped
 	}
 }
@@ -579,10 +630,18 @@ func (l *Limiter) startRenewal(job *Job) func() {
 // releaseCapacity hands a job's reservation back to the datastore. Losing this
 // call leaves capacity reserved for work that has already finished, so it is
 // retried before being reported through Options.OnError.
+//
+// The whole effort is bounded by one deadline that does *not* derive from the
+// limiter's operation context: a release has to succeed precisely because the
+// limiter is shutting down, so shutdown must not cancel it. Bounding it keeps a
+// wedged store from holding Stop open indefinitely.
 func (l *Limiter) releaseCapacity(job *Job) {
+	ctx, cancel := context.WithTimeout(context.Background(), l.opts.releaseBudget())
+	defer cancel()
+
 	var err error
 	for attempt := 1; attempt <= defaultRegisterDoneAttempts; attempt++ {
-		err = l.releaseOnce(job)
+		err = l.releaseOnce(ctx, job)
 		if err == nil {
 			return
 		}
@@ -594,9 +653,15 @@ func (l *Limiter) releaseCapacity(job *Job) {
 		if errors.Is(err, ErrLeaseLost) {
 			return
 		}
+		// Out of budget: the store has had its chance, and retrying past the
+		// lease TTL cannot help because the store reclaims the lease itself.
+		if ctx.Err() != nil {
+			break
+		}
 		if attempt < defaultRegisterDoneAttempts {
 			select {
 			case <-time.After(time.Duration(attempt) * l.opts.retryInterval()):
+			case <-ctx.Done():
 			case <-l.stopCh:
 				// Try once more immediately, then give up: Stop is waiting on
 				// this worker.
@@ -608,10 +673,11 @@ func (l *Limiter) releaseCapacity(job *Job) {
 }
 
 // releaseOnce performs a single release attempt against whichever store
-// interface is in use.
-func (l *Limiter) releaseOnce(job *Job) error {
+// interface is in use. The legacy Datastore takes no context, so its release
+// cannot be bounded from here.
+func (l *Limiter) releaseOnce(ctx context.Context, job *Job) error {
 	if l.leaseStore != nil && job.lease != nil {
-		return l.leaseStore.Release(context.Background(), job.lease)
+		return l.leaseStore.Release(ctx, job.lease)
 	}
 	return l.datastore.RegisterDone(l.opts.ID, job.Weight)
 }
