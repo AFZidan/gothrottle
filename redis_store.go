@@ -228,7 +228,10 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 	return nil
 }
 
-// Disconnect cleans up any connections.
+// Disconnect releases this store's resources. The *redis.Client passed to
+// NewRedisStore was created by the caller and stays open: other stores,
+// limiters or application components may still be using it. Callers close the
+// client themselves when they are done with it.
 func (rs *RedisStore) Disconnect() error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -238,10 +241,29 @@ func (rs *RedisStore) Disconnect() error {
 		rs.cancelFunc = nil
 	}
 
-	if rs.client != nil {
-		err := rs.client.Close()
-		rs.client = nil
-		return err
+	// Dropping the reference marks the store closed; subsequent calls return
+	// ErrStoreClosed.
+	rs.client = nil
+
+	return nil
+}
+
+// Close disconnects the store and additionally closes the underlying
+// *redis.Client. Use it only when this store is the sole owner of the client;
+// Disconnect leaves the client open for other users.
+func (rs *RedisStore) Close() error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if rs.cancelFunc != nil {
+		rs.cancelFunc()
+		rs.cancelFunc = nil
+	}
+
+	client := rs.client
+	rs.client = nil
+	if client != nil {
+		return client.Close()
 	}
 
 	return nil

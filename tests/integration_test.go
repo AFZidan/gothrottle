@@ -189,6 +189,102 @@ func TestRedisStore_ClosedClientBehavior(t *testing.T) {
 	}
 }
 
+func TestRedisStore_DisconnectLeavesClientUsable(t *testing.T) {
+	client := newTestRedisClient(t)
+
+	store, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore failed: %v", err)
+	}
+	if err := store.Disconnect(); err != nil {
+		t.Fatalf("Disconnect failed: %v", err)
+	}
+
+	// The caller created the client, so Disconnect must not close it: other
+	// stores, limiters or application code may still be using it.
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		t.Fatalf("Redis client is unusable after store.Disconnect: %v", err)
+	}
+
+	// A second store on the same client keeps working.
+	other, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore on shared client failed: %v", err)
+	}
+	defer func() { _ = other.Disconnect() }()
+
+	canRun, _, err := other.Request(uniqueLimiterID("shared-client"), 1, gothrottle.Options{MaxConcurrent: 1})
+	if err != nil {
+		t.Fatalf("Request on shared client failed: %v", err)
+	}
+	if !canRun {
+		t.Fatal("Request on shared client should be allowed")
+	}
+}
+
+func TestRedisStore_CloseClosesClient(t *testing.T) {
+	client := newTestRedisClient(t)
+
+	store, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore failed: %v", err)
+	}
+
+	// Close is the explicit opt-in that also tears down the client.
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if err := client.Ping(context.Background()).Err(); err == nil {
+		t.Fatal("Redis client should be closed after store.Close")
+	}
+}
+
+func TestLimiter_StopKeepsSharedRedisClientUsable(t *testing.T) {
+	client := newTestRedisClient(t)
+
+	store, err := gothrottle.NewRedisStore(client)
+	if err != nil {
+		t.Fatalf("NewRedisStore failed: %v", err)
+	}
+	defer func() { _ = store.Disconnect() }()
+
+	limiter, err := gothrottle.NewLimiter(gothrottle.Options{
+		ID:            uniqueLimiterID("stop-shared-redis"),
+		MaxConcurrent: 1,
+		Datastore:     store,
+	})
+	if err != nil {
+		t.Fatalf("NewLimiter failed: %v", err)
+	}
+
+	if _, err := limiter.Schedule(func() (interface{}, error) { return "ok", nil }); err != nil {
+		t.Fatalf("Schedule failed: %v", err)
+	}
+	if err := limiter.Stop(); err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+
+	// Stopping a limiter must not invalidate the caller's Redis client or the
+	// store shared with other limiters.
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		t.Fatalf("Redis client is unusable after limiter.Stop: %v", err)
+	}
+
+	second, err := gothrottle.NewLimiter(gothrottle.Options{
+		ID:            uniqueLimiterID("stop-shared-redis-2"),
+		MaxConcurrent: 1,
+		Datastore:     store,
+	})
+	if err != nil {
+		t.Fatalf("NewLimiter on shared store failed: %v", err)
+	}
+	defer func() { _ = second.Stop() }()
+
+	if _, err := second.Schedule(func() (interface{}, error) { return "ok", nil }); err != nil {
+		t.Fatalf("second limiter Schedule failed after first limiter stopped: %v", err)
+	}
+}
+
 func TestRedisStore_ReloadsMissingScript(t *testing.T) {
 	client := newTestRedisClient(t)
 

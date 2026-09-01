@@ -115,6 +115,9 @@ type Options struct {
     MaxConcurrent int           // Maximum concurrent jobs (0 = unlimited)
     MinTime       time.Duration // Minimum time between jobs
     Datastore     Datastore     // Storage backend (nil = LocalStore)
+
+    // Let Stop() disconnect an injected Datastore (default false)
+    CloseDatastoreOnStop bool
 }
 ```
 
@@ -142,7 +145,35 @@ Returns a wrapped version of the function that applies rate limiting.
 
 Stops the limiter and cleans up resources.
 
-`Stop` waits for running jobs to finish, cancels queued jobs with `ErrStoreClosed`, and is safe to call more than once.
+`Stop` cancels queued jobs with `ErrStoreClosed`, waits for running jobs to
+finish, and guarantees no task starts after shutdown begins — including a task
+whose capacity request was already in flight. It is safe to call concurrently
+and repeatedly; every caller blocks until shutdown completes and receives the
+same error. Do not call `Stop` from inside a scheduled task: it waits for that
+task to finish.
+
+#### Datastore ownership
+
+A datastore you pass in stays yours. `Stop` only disconnects the `LocalStore`
+the limiter creates for itself, so stopping one limiter cannot break other
+limiters sharing the same store, or other parts of your application sharing the
+same Redis client:
+
+```go
+store, _ := gothrottle.NewRedisStore(rdb)
+
+a, _ := gothrottle.NewLimiter(gothrottle.Options{ID: "a", Datastore: store})
+b, _ := gothrottle.NewLimiter(gothrottle.Options{ID: "b", Datastore: store})
+
+a.Stop()             // b and rdb are unaffected
+b.Stop()
+store.Disconnect()   // release the store when you are done with it
+rdb.Close()          // you own the client, so you close it
+```
+
+Set `CloseDatastoreOnStop: true` to transfer ownership to a single limiter.
+`RedisStore.Disconnect()` leaves the client open; `RedisStore.Close()` also
+closes the client, for when the store is its sole user.
 
 ### Validation Errors
 
@@ -172,6 +203,9 @@ Redis-based storage for distributed rate limiting across multiple application in
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 store, err := gothrottle.NewRedisStore(rdb)
 ```
+
+`Disconnect()` releases the store but leaves `rdb` open, because the client is
+yours. Use `Close()` when the store is the only user of the client.
 
 ## Architecture
 

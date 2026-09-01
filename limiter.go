@@ -11,12 +11,28 @@ import (
 type Limiter struct {
 	opts      Options
 	datastore Datastore
-	queue     *PriorityQueue
-	mu        sync.RWMutex
-	running   bool
+
+	// ownsDatastore records whether Stop is allowed to disconnect the
+	// datastore. It is only true for the LocalStore the limiter creates for
+	// itself, or when the caller opts in with Options.CloseDatastoreOnStop.
+	ownsDatastore bool
+
+	queue   *PriorityQueue
+	mu      sync.RWMutex
+	running bool
+
+	// Shutdown state machine. stopCh is closed as soon as Stop is called so
+	// the scheduler and any pending waits unblock; stoppedCh is closed only
+	// after the scheduler and all workers have finished and the datastore has
+	// been released, so concurrent Stop callers all observe a completed
+	// shutdown and the same error.
 	stopCh    chan struct{}
-	wg        sync.WaitGroup
-	workerWG  sync.WaitGroup
+	stoppedCh chan struct{}
+	stopOnce  sync.Once
+	stopErr   error
+
+	wg       sync.WaitGroup
+	workerWG sync.WaitGroup
 }
 
 // NewLimiter creates a new Limiter instance.
@@ -31,20 +47,26 @@ func NewLimiter(opts Options) (*Limiter, error) {
 		}
 	}
 
-	// Default to LocalStore if no datastore is provided
+	// Default to LocalStore if no datastore is provided. A store the limiter
+	// creates itself is owned by the limiter; an injected one is not, unless
+	// the caller explicitly transfers ownership.
 	datastore := opts.Datastore
+	ownsDatastore := opts.CloseDatastoreOnStop
 	if datastore == nil {
 		datastore = NewLocalStore()
+		ownsDatastore = true
 		if opts.ID == "" {
 			opts.ID = "default"
 		}
 	}
 
 	limiter := &Limiter{
-		opts:      opts,
-		datastore: datastore,
-		queue:     NewPriorityQueue(),
-		stopCh:    make(chan struct{}),
+		opts:          opts,
+		datastore:     datastore,
+		ownsDatastore: ownsDatastore,
+		queue:         NewPriorityQueue(),
+		stopCh:        make(chan struct{}),
+		stoppedCh:     make(chan struct{}),
 	}
 
 	// Start the scheduler
@@ -117,23 +139,46 @@ func (l *Limiter) start() {
 	go l.scheduler()
 }
 
-// Stop stops the limiter and waits for all jobs to complete.
+// Stop stops the limiter, cancels queued jobs and waits for running jobs to
+// finish. It is safe to call concurrently and repeatedly: every caller blocks
+// until shutdown has completed and receives the same error.
+//
+// The datastore is only disconnected if the limiter owns it (see
+// Options.CloseDatastoreOnStop). An injected datastore stays usable so that
+// other limiters, or other parts of the application sharing the same Redis
+// client, are unaffected.
+//
+// Stop must not be called from inside a scheduled task; doing so deadlocks
+// because Stop waits for that task to finish.
 func (l *Limiter) Stop() error {
-	l.mu.Lock()
-	if !l.running {
+	l.stopOnce.Do(func() {
+		l.mu.Lock()
+		l.running = false
+		close(l.stopCh)
 		l.mu.Unlock()
-		return nil
-	}
-	l.running = false
-	close(l.stopCh)
-	l.mu.Unlock()
 
-	// Wait for scheduler to finish
-	l.wg.Wait()
-	l.workerWG.Wait()
+		// Wait for the scheduler to finish (it cancels queued jobs on its way
+		// out), then for every worker so their RegisterDone calls land before
+		// the datastore is released.
+		l.wg.Wait()
+		l.workerWG.Wait()
 
-	// Disconnect datastore
-	return l.datastore.Disconnect()
+		if l.ownsDatastore {
+			l.stopErr = l.datastore.Disconnect()
+		}
+
+		close(l.stoppedCh)
+	})
+
+	<-l.stoppedCh
+	return l.stopErr
+}
+
+// isRunning reports whether the limiter is still accepting and starting work.
+func (l *Limiter) isRunning() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.running
 }
 
 // scheduler is the main scheduling loop that runs in a background goroutine.
@@ -146,7 +191,7 @@ func (l *Limiter) scheduler() {
 	for {
 		select {
 		case <-l.stopCh:
-			// Process remaining jobs before stopping
+			// Cancel anything still queued before stopping
 			l.processRemainingJobs()
 			return
 		case <-ticker.C:
@@ -163,7 +208,6 @@ func (l *Limiter) processJobs() {
 		return
 	}
 
-	// Peek at the next job without removing it
 	job := l.queue.PopJob()
 	if job == nil {
 		l.mu.Unlock()
@@ -174,7 +218,7 @@ func (l *Limiter) processJobs() {
 	// Check if job can run
 	canRun, waitTime, err := l.datastore.Request(l.opts.ID, job.Weight, l.opts)
 	if err != nil {
-		job.errorChan <- fmt.Errorf("datastore error: %w", err)
+		l.failJob(job, fmt.Errorf("datastore error: %w", err))
 		return
 	}
 
@@ -183,10 +227,11 @@ func (l *Limiter) processJobs() {
 		l.mu.Lock()
 		if l.running {
 			l.queue.PushJob(job)
+			l.mu.Unlock()
 		} else {
-			job.errorChan <- ErrStoreClosed
+			l.mu.Unlock()
+			l.failJob(job, ErrStoreClosed)
 		}
-		l.mu.Unlock()
 
 		// Sleep if wait time is suggested
 		if waitTime > 0 {
@@ -194,14 +239,21 @@ func (l *Limiter) processJobs() {
 			select {
 			case <-timer.C:
 			case <-l.stopCh:
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+				if !timer.Stop() {
+					<-timer.C
 				}
 			}
 		}
+		return
+	}
+
+	// Capacity has been reserved in the datastore. Stop may have been called
+	// while the request was in flight, so re-check before starting work: a
+	// task must never begin after shutdown started. The reservation is handed
+	// back so the capacity is not leaked for other limiters sharing the store.
+	if !l.isRunning() {
+		l.releaseCapacity(job.Weight)
+		l.failJob(job, ErrStoreClosed)
 		return
 	}
 
@@ -215,17 +267,9 @@ func (l *Limiter) executeJob(job *Job) {
 	defer l.workerWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
-			select {
-			case job.errorChan <- fmt.Errorf("%w: %v", ErrTaskPanic, r):
-			default:
-			}
+			l.failJob(job, fmt.Errorf("%w: %v", ErrTaskPanic, r))
 		}
-		// Register job completion
-		if err := l.datastore.RegisterDone(l.opts.ID, job.Weight); err != nil {
-			// Log error but don't fail the job
-			// In a real implementation, you might want to use a logger here
-			_ = err
-		}
+		l.releaseCapacity(job.Weight)
 	}()
 
 	// Execute the job
@@ -233,10 +277,7 @@ func (l *Limiter) executeJob(job *Job) {
 
 	// Send result back
 	if err != nil {
-		select {
-		case job.errorChan <- err:
-		default:
-		}
+		l.failJob(job, err)
 	} else {
 		select {
 		case job.resultChan <- result:
@@ -245,23 +286,35 @@ func (l *Limiter) executeJob(job *Job) {
 	}
 }
 
-// processRemainingJobs processes any remaining jobs when stopping.
+// releaseCapacity returns a job's reserved weight to the datastore.
+func (l *Limiter) releaseCapacity(weight int) {
+	if err := l.datastore.RegisterDone(l.opts.ID, weight); err != nil {
+		// TODO(phase 4): surface through Options.OnError with retries.
+		_ = err
+	}
+}
+
+// failJob delivers a terminal error to a job's caller without blocking. The
+// error channel is buffered, and a job only ever receives one outcome, so the
+// default case is defensive.
+func (l *Limiter) failJob(job *Job, err error) {
+	select {
+	case job.errorChan <- err:
+	default:
+	}
+}
+
+// processRemainingJobs cancels any jobs still queued when stopping.
 func (l *Limiter) processRemainingJobs() {
 	for {
 		l.mu.Lock()
-		if l.queue.IsEmpty() {
-			l.mu.Unlock()
-			break
-		}
-
 		job := l.queue.PopJob()
 		l.mu.Unlock()
 
 		if job == nil {
-			break
+			return
 		}
 
-		// Cancel remaining jobs
-		job.errorChan <- ErrStoreClosed
+		l.failJob(job, ErrStoreClosed)
 	}
 }
