@@ -16,6 +16,7 @@ type Limiter struct {
 	running   bool
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
+	workerWG  sync.WaitGroup
 }
 
 // NewLimiter creates a new Limiter instance.
@@ -23,6 +24,11 @@ func NewLimiter(opts Options) (*Limiter, error) {
 	// Validate options
 	if opts.Datastore != nil && opts.ID == "" {
 		return nil, ErrMissingID
+	}
+	if opts.ID != "" {
+		if err := validateLimiterID(opts.ID); err != nil {
+			return nil, err
+		}
 	}
 
 	// Default to LocalStore if no datastore is provided
@@ -54,8 +60,14 @@ func (l *Limiter) Schedule(task func() (interface{}, error)) (interface{}, error
 
 // ScheduleWithOptions submits a job with custom priority and weight.
 func (l *Limiter) ScheduleWithOptions(task func() (interface{}, error), priority, weight int) (interface{}, error) {
+	if task == nil {
+		return nil, ErrNilTask
+	}
 	if weight <= 0 {
 		return nil, ErrInvalidWeight
+	}
+	if l.opts.MaxConcurrent > 0 && weight > l.opts.MaxConcurrent {
+		return nil, ErrWeightExceedsMax
 	}
 
 	job := &Job{
@@ -118,6 +130,7 @@ func (l *Limiter) Stop() error {
 
 	// Wait for scheduler to finish
 	l.wg.Wait()
+	l.workerWG.Wait()
 
 	// Disconnect datastore
 	return l.datastore.Disconnect()
@@ -144,19 +157,19 @@ func (l *Limiter) scheduler() {
 
 // processJobs checks for pending jobs and executes them if allowed.
 func (l *Limiter) processJobs() {
-	l.mu.RLock()
+	l.mu.Lock()
 	if l.queue.IsEmpty() || !l.running {
-		l.mu.RUnlock()
+		l.mu.Unlock()
 		return
 	}
 
 	// Peek at the next job without removing it
 	job := l.queue.PopJob()
 	if job == nil {
-		l.mu.RUnlock()
+		l.mu.Unlock()
 		return
 	}
-	l.mu.RUnlock()
+	l.mu.Unlock()
 
 	// Check if job can run
 	canRun, waitTime, err := l.datastore.Request(l.opts.ID, job.Weight, l.opts)
@@ -168,23 +181,45 @@ func (l *Limiter) processJobs() {
 	if !canRun {
 		// Put job back in queue
 		l.mu.Lock()
-		l.queue.PushJob(job)
+		if l.running {
+			l.queue.PushJob(job)
+		} else {
+			job.errorChan <- ErrStoreClosed
+		}
 		l.mu.Unlock()
 
 		// Sleep if wait time is suggested
 		if waitTime > 0 {
-			time.Sleep(waitTime)
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-timer.C:
+			case <-l.stopCh:
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 		return
 	}
 
 	// Execute job asynchronously
+	l.workerWG.Add(1)
 	go l.executeJob(job)
 }
 
 // executeJob runs a job and handles its completion.
 func (l *Limiter) executeJob(job *Job) {
+	defer l.workerWG.Done()
 	defer func() {
+		if r := recover(); r != nil {
+			select {
+			case job.errorChan <- fmt.Errorf("%w: %v", ErrTaskPanic, r):
+			default:
+			}
+		}
 		// Register job completion
 		if err := l.datastore.RegisterDone(l.opts.ID, job.Weight); err != nil {
 			// Log error but don't fail the job
@@ -213,14 +248,14 @@ func (l *Limiter) executeJob(job *Job) {
 // processRemainingJobs processes any remaining jobs when stopping.
 func (l *Limiter) processRemainingJobs() {
 	for {
-		l.mu.RLock()
+		l.mu.Lock()
 		if l.queue.IsEmpty() {
-			l.mu.RUnlock()
+			l.mu.Unlock()
 			break
 		}
 
 		job := l.queue.PopJob()
-		l.mu.RUnlock()
+		l.mu.Unlock()
 
 		if job == nil {
 			break

@@ -28,6 +28,10 @@ func NewLocalStore() *LocalStore {
 
 // Request checks if a job can run according to the limiter's rules.
 func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRun bool, waitTime time.Duration, err error) {
+	if weight <= 0 {
+		return false, 0, ErrInvalidWeight
+	}
+
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 
@@ -69,6 +73,10 @@ func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRu
 
 // RegisterDone informs the store that a job has finished.
 func (ls *LocalStore) RegisterDone(limiterID string, weight int) error {
+	if weight <= 0 {
+		return ErrInvalidWeight
+	}
+
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 

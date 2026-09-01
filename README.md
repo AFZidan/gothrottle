@@ -132,6 +132,8 @@ Schedules a job with default priority (5) and weight (1). Blocks until completio
 
 Schedules a job with custom priority and weight. Higher priority jobs run first.
 
+Returns `ErrNilTask` for nil tasks, `ErrInvalidWeight` for non-positive weights, and `ErrWeightExceedsMax` when a weighted job cannot fit within the configured `MaxConcurrent` limit.
+
 #### `Wrap(fn func() (interface{}, error)) func() (interface{}, error)`
 
 Returns a wrapped version of the function that applies rate limiting.
@@ -139,6 +141,18 @@ Returns a wrapped version of the function that applies rate limiting.
 #### `Stop() error`
 
 Stops the limiter and cleans up resources.
+
+`Stop` waits for running jobs to finish, cancels queued jobs with `ErrStoreClosed`, and is safe to call more than once.
+
+### Validation Errors
+
+- `ErrMissingID`: returned when a datastore-backed limiter is created without an ID.
+- `ErrInvalidID`: returned when a limiter ID is too long or contains control characters.
+- `ErrInvalidWeight`: returned when a job or datastore operation uses a non-positive weight.
+- `ErrWeightExceedsMax`: returned when a job weight exceeds the configured `MaxConcurrent` limit.
+- `ErrNilTask`: returned when scheduling a nil task function.
+- `ErrTaskPanic`: wraps panics from scheduled task functions and returns them as errors.
+- `ErrStoreClosed`: returned when scheduling against a stopped limiter or closed datastore.
 
 ### Storage Backends
 

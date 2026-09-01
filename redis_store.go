@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha1" // #nosec G505 - SHA1 is used for Redis script hashing, not cryptographic security
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -16,10 +18,15 @@ type RedisStore struct {
 	scriptSHA  string
 	ctx        context.Context
 	cancelFunc context.CancelFunc
+	mu         sync.RWMutex
 }
 
 // NewRedisStore creates a new RedisStore instance.
 func NewRedisStore(client *redis.Client) (*RedisStore, error) {
+	if client == nil {
+		return nil, ErrStoreClosed
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	rs := &RedisStore{
@@ -76,6 +83,17 @@ return {1, 0}
 
 // loadScript loads the Lua script into Redis and stores its SHA.
 func (rs *RedisStore) loadScript() error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	return rs.loadScriptLocked()
+}
+
+func (rs *RedisStore) loadScriptLocked() error {
+	if rs.client == nil {
+		return ErrStoreClosed
+	}
+
 	sha := fmt.Sprintf("%x", sha1.Sum([]byte(redisScript))) // #nosec G401 - SHA1 is used for Redis script hashing, not cryptographic security
 
 	// Check if script already exists
@@ -101,19 +119,56 @@ func (rs *RedisStore) loadScript() error {
 
 // Request checks if a job can run according to the limiter's rules.
 func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRun bool, waitTime time.Duration, err error) {
-	if rs.client == nil {
+	if limiterID == "" {
+		return false, 0, ErrMissingID
+	}
+	if err := validateLimiterID(limiterID); err != nil {
+		return false, 0, err
+	}
+	if weight <= 0 {
+		return false, 0, ErrInvalidWeight
+	}
+	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
+		return false, 0, ErrWeightExceedsMax
+	}
+
+	rs.mu.RLock()
+	client := rs.client
+	ctx := rs.ctx
+	sha := rs.scriptSHA
+	rs.mu.RUnlock()
+	if client == nil {
 		return false, 0, ErrStoreClosed
 	}
 
 	key := fmt.Sprintf("gothrottle:%s", limiterID)
 	currentTimeMs := time.Now().UnixMilli()
 
-	result, err := rs.client.EvalSha(rs.ctx, rs.scriptSHA, []string{key},
+	result, err := client.EvalSha(ctx, sha, []string{key},
 		opts.MaxConcurrent,
 		opts.MinTime.Milliseconds(),
 		weight,
 		currentTimeMs,
 	).Result()
+	if isRedisNoScript(err) {
+		if loadErr := rs.loadScript(); loadErr != nil {
+			return false, 0, fmt.Errorf("redis script reload error: %w", loadErr)
+		}
+		rs.mu.RLock()
+		client = rs.client
+		ctx = rs.ctx
+		sha = rs.scriptSHA
+		rs.mu.RUnlock()
+		if client == nil {
+			return false, 0, ErrStoreClosed
+		}
+		result, err = client.EvalSha(ctx, sha, []string{key},
+			opts.MaxConcurrent,
+			opts.MinTime.Milliseconds(),
+			weight,
+			currentTimeMs,
+		).Result()
+	}
 
 	if err != nil {
 		return false, 0, fmt.Errorf("redis eval error: %w", err)
@@ -145,15 +200,29 @@ func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRu
 
 // RegisterDone informs the store that a job has finished.
 func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
-	if rs.client == nil {
+	if limiterID == "" {
+		return ErrMissingID
+	}
+	if err := validateLimiterID(limiterID); err != nil {
+		return err
+	}
+	if weight <= 0 {
+		return ErrInvalidWeight
+	}
+
+	rs.mu.RLock()
+	client := rs.client
+	ctx := rs.ctx
+	rs.mu.RUnlock()
+	if client == nil {
 		return ErrStoreClosed
 	}
 
 	key := fmt.Sprintf("gothrottle:%s", limiterID)
 
-	err := rs.client.HIncrBy(rs.ctx, key, "running", int64(-weight)).Err()
+	err := client.Eval(ctx, redisRegisterDoneScript, []string{key}, weight).Err()
 	if err != nil {
-		return fmt.Errorf("redis hincrby error: %w", err)
+		return fmt.Errorf("redis register done error: %w", err)
 	}
 
 	return nil
@@ -161,8 +230,12 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 
 // Disconnect cleans up any connections.
 func (rs *RedisStore) Disconnect() error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
 	if rs.cancelFunc != nil {
 		rs.cancelFunc()
+		rs.cancelFunc = nil
 	}
 
 	if rs.client != nil {
@@ -172,4 +245,21 @@ func (rs *RedisStore) Disconnect() error {
 	}
 
 	return nil
+}
+
+const redisRegisterDoneScript = `
+local key = KEYS[1]
+local weight = tonumber(ARGV[1])
+local running = tonumber(redis.call("HGET", key, "running") or "0")
+running = running - weight
+if running < 0 then
+    running = 0
+end
+redis.call("HSET", key, "running", running)
+redis.call("PEXPIRE", key, 30000)
+return running
+`
+
+func isRedisNoScript(err error) bool {
+	return err != nil && strings.Contains(strings.ToUpper(err.Error()), "NOSCRIPT")
 }
