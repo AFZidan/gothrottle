@@ -21,7 +21,8 @@
 
 - **Local and Distributed Rate Limiting**: Supports both in-memory (LocalStore) and Redis-based (RedisStore) backends
 - **Configurable Limits**: Set maximum concurrent jobs and minimum time between jobs
-- **Priority Queue**: Jobs are executed based on priority
+- **Priority Queue**: Jobs are executed by priority, FIFO within a priority
+- **Event-Driven Scheduler**: Dispatches as capacity frees up, with no idle polling
 - **Atomic Operations**: Redis operations use Lua scripts to prevent race conditions
 - **Easy Integration**: Simple API for wrapping existing functions
 
@@ -118,8 +119,37 @@ type Options struct {
 
     // Let Stop() disconnect an injected Datastore (default false)
     CloseDatastoreOnStop bool
+
+    // How weighted jobs compete for capacity (default SchedStrict)
+    SchedPolicy SchedPolicy
+
+    // How often to re-check a distributed store while blocked (default 10ms)
+    RetryInterval time.Duration
 }
 ```
+
+### Scheduling
+
+The scheduler is event-driven: it wakes when a job is enqueued, when a running
+job releases capacity, or when a `MinTime` window expires. An idle limiter does
+not wake at all, and a burst of jobs fills the available concurrency window
+immediately instead of starting one job per tick.
+
+Jobs are ordered by priority (higher first), and equal-priority jobs run in
+submission order (FIFO).
+
+`SchedPolicy` decides what happens when the highest-priority job is too heavy
+for the free capacity:
+
+- `SchedStrict` (default) — the heavy job holds the queue. Priority is never
+  inverted, but capacity can sit idle while it waits.
+- `SchedBestFit` — lighter, lower-priority jobs may use capacity the heavy job
+  cannot fill yet. Better throughput, at the cost of letting light work overtake
+  a heavy high-priority job.
+
+`RetryInterval` only applies to distributed setups: when a shared store refuses
+capacity, the release happens in another process and produces no local event, so
+the scheduler re-checks on this interval.
 
 ### Limiter Methods
 

@@ -21,6 +21,21 @@ type Limiter struct {
 	mu      sync.RWMutex
 	running bool
 
+	// seq assigns each job a monotonic sequence number so equal-priority jobs
+	// keep FIFO order. Guarded by mu.
+	seq uint64
+
+	// localWeight is the weight this limiter currently has running. The
+	// scheduler uses it to decide whether waiting for a local completion can
+	// unblock a concurrency-blocked queue, or whether only another process can.
+	// Guarded by mu.
+	localWeight int
+
+	// wake carries scheduling events (job enqueued, capacity released). It is
+	// buffered with size 1 and sent to non-blockingly: a pending wake-up is all
+	// the scheduler needs, since it drains the whole queue on each pass.
+	wake chan struct{}
+
 	// Shutdown state machine. stopCh is closed as soon as Stop is called so
 	// the scheduler and any pending waits unblock; stoppedCh is closed only
 	// after the scheduler and all workers have finished and the datastore has
@@ -65,6 +80,7 @@ func NewLimiter(opts Options) (*Limiter, error) {
 		datastore:     datastore,
 		ownsDatastore: ownsDatastore,
 		queue:         NewPriorityQueue(),
+		wake:          make(chan struct{}, 1),
 		stopCh:        make(chan struct{}),
 		stoppedCh:     make(chan struct{}),
 	}
@@ -106,8 +122,14 @@ func (l *Limiter) ScheduleWithOptions(task func() (interface{}, error), priority
 		l.mu.Unlock()
 		return nil, ErrStoreClosed
 	}
+	l.seq++
+	job.seq = l.seq
 	l.queue.PushJob(job)
 	l.mu.Unlock()
+
+	// Wake the scheduler so the job is considered immediately rather than on
+	// the next tick.
+	l.signal()
 
 	// Wait for job completion
 	select {
@@ -115,6 +137,16 @@ func (l *Limiter) ScheduleWithOptions(task func() (interface{}, error), priority
 		return result, nil
 	case err := <-job.errorChan:
 		return nil, err
+	}
+}
+
+// signal nudges the scheduler. The wake channel is buffered with size 1, so a
+// pending notification is coalesced: the scheduler drains the whole queue on
+// each pass, and a missed duplicate would be redundant.
+func (l *Limiter) signal() {
+	select {
+	case l.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -174,92 +206,182 @@ func (l *Limiter) Stop() error {
 	return l.stopErr
 }
 
-// isRunning reports whether the limiter is still accepting and starting work.
-func (l *Limiter) isRunning() bool {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.running
-}
-
-// scheduler is the main scheduling loop that runs in a background goroutine.
+// scheduler is the main scheduling loop. It sleeps until something can change
+// the outcome of a dispatch attempt — a job being enqueued, a worker releasing
+// capacity, a MinTime deadline expiring, or shutdown — instead of polling on a
+// fixed tick. An idle limiter therefore does not wake at all, and a burst of
+// jobs is dispatched as fast as capacity allows rather than one per tick.
 func (l *Limiter) scheduler() {
 	defer l.wg.Done()
 
-	ticker := time.NewTicker(10 * time.Millisecond) // Small polling interval
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	timerArmed := false
 
 	for {
+		wait := l.dispatch()
+
+		// Arm the timer only when the queue is blocked on a deadline: a MinTime
+		// window that has to elapse, or a distributed retry.
+		if timerArmed && !timer.Stop() {
+			// Drain a timer that fired while we were dispatching.
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerArmed = false
+		if wait > 0 {
+			timer.Reset(wait)
+			timerArmed = true
+		}
+
 		select {
 		case <-l.stopCh:
+			if timerArmed && !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			// Cancel anything still queued before stopping
 			l.processRemainingJobs()
 			return
-		case <-ticker.C:
-			l.processJobs()
+		case <-l.wake:
+		case <-timer.C:
+			timerArmed = false
 		}
 	}
 }
 
-// processJobs checks for pending jobs and executes them if allowed.
-func (l *Limiter) processJobs() {
-	l.mu.Lock()
-	if l.queue.IsEmpty() || !l.running {
-		l.mu.Unlock()
-		return
-	}
-
-	job := l.queue.PopJob()
-	if job == nil {
-		l.mu.Unlock()
-		return
-	}
-	l.mu.Unlock()
-
-	// Check if job can run
-	canRun, waitTime, err := l.datastore.Request(l.opts.ID, job.Weight, l.opts)
-	if err != nil {
-		l.failJob(job, fmt.Errorf("datastore error: %w", err))
-		return
-	}
-
-	if !canRun {
-		// Put job back in queue
-		l.mu.Lock()
-		if l.running {
-			l.queue.PushJob(job)
-			l.mu.Unlock()
-		} else {
-			l.mu.Unlock()
-			l.failJob(job, ErrStoreClosed)
+// dispatch starts every queued job that can run right now. It returns how long
+// to wait before trying again, or 0 when only an external event (a new job or a
+// capacity release) can change the outcome.
+func (l *Limiter) dispatch() time.Duration {
+	for {
+		job, running := l.claimNextJob()
+		if !running || job == nil {
+			// Either shutting down, the queue is empty, or the queue is blocked
+			// on local capacity — in which case a worker completion will signal
+			// the scheduler.
+			return 0
 		}
 
-		// Sleep if wait time is suggested
-		if waitTime > 0 {
-			timer := time.NewTimer(waitTime)
-			select {
-			case <-timer.C:
-			case <-l.stopCh:
-				if !timer.Stop() {
-					<-timer.C
-				}
+		canRun, waitTime, err := l.datastore.Request(l.opts.ID, job.Weight, l.opts)
+		if err != nil {
+			// The claimed job is not requeued: its caller is unblocked with the
+			// error and decides whether to retry. Back off before touching the
+			// datastore again so one outage does not fail the whole queue in a
+			// tight loop.
+			l.failJob(job, fmt.Errorf("datastore error: %w", err))
+			return l.opts.retryInterval()
+		}
+
+		if !canRun {
+			if !l.releaseJob(job) {
+				l.failJob(job, ErrStoreClosed)
+				return 0
+			}
+
+			if waitTime > 0 {
+				// A MinTime window has to elapse; nothing else will wake us.
+				return waitTime
+			}
+			// Concurrency-refused by the store. Capacity may be held by this
+			// limiter (a local completion will signal us immediately), but it
+			// may equally be held by another limiter on the same store or
+			// another process, and those releases produce no local event. Poll
+			// as a backstop; the wake channel still gives immediate dispatch in
+			// the local case.
+			return l.opts.retryInterval()
+		}
+
+		// Capacity has been reserved in the datastore. Stop may have been called
+		// while the request was in flight, so re-check before starting work: a
+		// task must never begin after shutdown started. The reservation is handed
+		// back so the capacity is not leaked for other limiters sharing the store.
+		if !l.startJob(job) {
+			l.releaseCapacity(job.Weight)
+			l.failJob(job, ErrStoreClosed)
+			return 0
+		}
+	}
+}
+
+// claimNextJob removes the next dispatchable job from the queue. It returns nil
+// when nothing is eligible — the queue is empty, or this limiter's own
+// concurrency window is full and a worker completion has to free it first — and
+// reports whether the limiter is still running.
+func (l *Limiter) claimNextJob() (job *Job, running bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if !l.running {
+		return nil, false
+	}
+	if l.queue.IsEmpty() {
+		return nil, true
+	}
+
+	next := l.queue.Peek()
+	if l.opts.MaxConcurrent > 0 {
+		free := l.opts.MaxConcurrent - l.localWeight
+		if free <= 0 {
+			// Fully committed locally. Skip the datastore round trip; a worker
+			// completion will wake us.
+			return nil, true
+		}
+		if next.Weight > free {
+			if l.opts.SchedPolicy != SchedBestFit {
+				// Strict priority: the head job holds the queue until it fits.
+				return nil, true
+			}
+			// Best fit: let a lighter job use the capacity the head job cannot
+			// fill yet.
+			next = l.queue.peekFit(free)
+			if next == nil {
+				return nil, true
 			}
 		}
-		return
 	}
 
-	// Capacity has been reserved in the datastore. Stop may have been called
-	// while the request was in flight, so re-check before starting work: a
-	// task must never begin after shutdown started. The reservation is handed
-	// back so the capacity is not leaked for other limiters sharing the store.
-	if !l.isRunning() {
-		l.releaseCapacity(job.Weight)
-		l.failJob(job, ErrStoreClosed)
-		return
+	if !l.queue.Remove(next) {
+		return nil, true
 	}
+	return next, true
+}
 
-	// Execute job asynchronously
+// releaseJob puts a claimed job back in the queue after capacity was refused.
+// It reports false when the limiter stopped in the meantime, in which case the
+// caller must cancel the job.
+func (l *Limiter) releaseJob(job *Job) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if !l.running {
+		return false
+	}
+	l.queue.PushJob(job)
+	return true
+}
+
+// startJob accounts for a job whose capacity has been granted and launches its
+// worker. It reports false when the limiter stopped while capacity was being
+// acquired, in which case no worker is started.
+func (l *Limiter) startJob(job *Job) bool {
+	l.mu.Lock()
+	if !l.running {
+		l.mu.Unlock()
+		return false
+	}
+	l.localWeight += job.Weight
+	l.mu.Unlock()
+
 	l.workerWG.Add(1)
 	go l.executeJob(job)
+	return true
 }
 
 // executeJob runs a job and handles its completion.
@@ -269,7 +391,17 @@ func (l *Limiter) executeJob(job *Job) {
 		if r := recover(); r != nil {
 			l.failJob(job, fmt.Errorf("%w: %v", ErrTaskPanic, r))
 		}
+
+		l.mu.Lock()
+		l.localWeight -= job.Weight
+		if l.localWeight < 0 {
+			l.localWeight = 0
+		}
+		l.mu.Unlock()
+
 		l.releaseCapacity(job.Weight)
+		// Freed capacity may let queued work start immediately.
+		l.signal()
 	}()
 
 	// Execute the job
