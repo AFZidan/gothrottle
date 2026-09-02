@@ -387,13 +387,50 @@ func (d *deadlineTimer) disarmed() {
 	d.armed = false
 }
 
+// refusalLimit is what a dispatch pass has learned from the datastore about how
+// heavy a job can be and still be admitted.
+//
+// A capacity refusal is information about the store, not just about the job that
+// asked: the weight was turned down, so nothing at least as heavy can fit either,
+// and only something strictly lighter is worth another round trip. Recording it as
+// a ceiling is also what keeps a refused job from being attempted twice in one
+// pass — it stays in the queue, but every subsequent claim is filtered to weights
+// below it — so jobs never leave the queue mid-pass and a cancelling caller can
+// still remove its own job.
+type refusalLimit struct {
+	ceiling int
+	set     bool
+}
+
+// lower narrows the limit after the store refused a job of this weight.
+func (r refusalLimit) lower(weight int) refusalLimit {
+	if lighter := weight - 1; !r.set || lighter < r.ceiling {
+		return refusalLimit{ceiling: lighter, set: true}
+	}
+	return r
+}
+
 // dispatch starts every queued job that can run right now. It returns how long
 // to wait before trying again, or 0 when only an external event (a new job or a
 // capacity release) can change the outcome.
 func (l *Limiter) dispatch() time.Duration {
+	// Under SchedBestFit a capacity refusal does not end the pass: the store may
+	// be full of weight held by another process, which this limiter's local
+	// weight cannot see, while a lighter queued job would still fit. Each refusal
+	// lowers the ceiling strictly, so every attempt is for a strictly lighter job
+	// and the pass cannot spin. Under SchedStrict the first refusal returns, so
+	// behavior there is unchanged.
+	var refused refusalLimit
+
 	for {
-		job, running := l.claimNextJob()
+		job, running := l.claimNextJob(refused)
 		if !running || job == nil {
+			if refused.set {
+				// Something was refused for capacity and nothing lighter is
+				// queued. The release that unblocks it may happen in another
+				// process and produce no local event, so arm a retry.
+				return l.opts.retryInterval()
+			}
 			// Either shutting down, the queue is empty, or the queue is blocked
 			// on local capacity — in which case a worker completion will signal
 			// the scheduler.
@@ -412,7 +449,7 @@ func (l *Limiter) dispatch() time.Duration {
 			// The claimed job is not requeued: its caller is unblocked with the
 			// error and decides whether to retry. Back off before touching the
 			// datastore again so one outage does not fail the whole queue in a
-			// tight loop.
+			// tight loop. Everything else stays queued.
 			l.failJob(job, fmt.Errorf("datastore error: %w", err))
 			return l.opts.retryInterval()
 		}
@@ -424,16 +461,24 @@ func (l *Limiter) dispatch() time.Duration {
 			}
 
 			if waitTime > 0 {
-				// A MinTime window has to elapse; nothing else will wake us.
+				// A MinTime window has to elapse. Spacing gates the limiter, not
+				// this job, so no lighter job could start either — looking for
+				// one would only burn datastore calls — and nothing else will
+				// wake us.
 				return waitTime
 			}
-			// Concurrency-refused by the store. Capacity may be held by this
-			// limiter (a local completion will signal us immediately), but it
-			// may equally be held by another limiter on the same store or
-			// another process, and those releases produce no local event. Poll
-			// as a backstop; the wake channel still gives immediate dispatch in
-			// the local case.
-			return l.opts.retryInterval()
+
+			// Capacity-refused with no deadline. Capacity may be held by this
+			// limiter (a local completion will signal us immediately), but it may
+			// equally be held by another limiter on the same store or another
+			// process, and those releases produce no local event. Poll as a
+			// backstop; the wake channel still gives immediate dispatch in the
+			// local case.
+			if l.opts.SchedPolicy != SchedBestFit {
+				return l.opts.retryInterval()
+			}
+			refused = refused.lower(job.Weight)
+			continue
 		}
 
 		// Capacity has been reserved in the datastore. Stop may have been called
@@ -490,7 +535,10 @@ func (l *Limiter) shutdownCancelled(err error) bool {
 // when nothing is eligible — the queue is empty, or this limiter's own
 // concurrency window is full and a worker completion has to free it first — and
 // reports whether the limiter is still running.
-func (l *Limiter) claimNextJob() (job *Job, running bool) {
+//
+// refused carries what the datastore has already turned down during this dispatch
+// pass, which narrows what is worth claiming next.
+func (l *Limiter) claimNextJob(refused refusalLimit) (job *Job, running bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -501,25 +549,24 @@ func (l *Limiter) claimNextJob() (job *Job, running bool) {
 		return nil, true
 	}
 
+	ceiling, bounded := l.weightCeilingLocked(refused)
+	if bounded && ceiling <= 0 {
+		// Fully committed locally, or the store just refused a weight-1 job.
+		// Nothing can fit; a worker completion or the armed retry will wake us.
+		return nil, true
+	}
+
 	next := l.queue.Peek()
-	if l.opts.MaxConcurrent > 0 {
-		free := l.opts.MaxConcurrent - l.localWeight
-		if free <= 0 {
-			// Fully committed locally. Skip the datastore round trip; a worker
-			// completion will wake us.
+	if bounded && next.Weight > ceiling {
+		if l.opts.SchedPolicy != SchedBestFit {
+			// Strict priority: the head job holds the queue until it fits.
 			return nil, true
 		}
-		if next.Weight > free {
-			if l.opts.SchedPolicy != SchedBestFit {
-				// Strict priority: the head job holds the queue until it fits.
-				return nil, true
-			}
-			// Best fit: let a lighter job use the capacity the head job cannot
-			// fill yet.
-			next = l.queue.peekFit(free)
-			if next == nil {
-				return nil, true
-			}
+		// Best fit: let a lighter job use the capacity the head job cannot
+		// fill yet.
+		next = l.queue.peekFit(ceiling)
+		if next == nil {
+			return nil, true
 		}
 	}
 
@@ -527,6 +574,27 @@ func (l *Limiter) claimNextJob() (job *Job, running bool) {
 		return nil, true
 	}
 	return next, true
+}
+
+// weightCeilingLocked is the heaviest job worth attempting right now, and whether
+// there is a ceiling at all. Callers must hold l.mu.
+//
+// Two things bound it. Local capacity — MaxConcurrent minus what this limiter is
+// already running — is known without a round trip, so a job that cannot fit
+// locally is never sent to the store. A refusal from the store lowers it further,
+// and that is what makes SchedBestFit work against capacity held elsewhere: the
+// local weight cannot see another process's reservations, but a refusal reveals
+// them.
+func (l *Limiter) weightCeilingLocked(refused refusalLimit) (ceiling int, bounded bool) {
+	if l.opts.MaxConcurrent > 0 {
+		ceiling = l.opts.MaxConcurrent - l.localWeight
+		bounded = true
+	}
+	if refused.set && (!bounded || refused.ceiling < ceiling) {
+		ceiling = refused.ceiling
+		bounded = true
+	}
+	return ceiling, bounded
 }
 
 // releaseJob puts a claimed job back in the queue after capacity was refused.
