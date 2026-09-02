@@ -86,6 +86,14 @@ type Options struct {
 
 // Validate reports configuration mistakes that would otherwise silently
 // weaken or disable throttling.
+//
+// Every admission path runs this — NewLimiter, and both stores' Request and
+// Acquire — so a direct datastore caller is held to exactly the same rules as a
+// limiter-mediated one. That includes the scheduler-only fields (SchedPolicy,
+// RetryInterval, MaxQueueSize) which no store reads: a negative RetryInterval is
+// a configuration mistake wherever it appears, and one validator with one
+// behavior is worth more than a store-specific subset that lets some mistakes
+// through depending on which entry point was used.
 func (o Options) Validate() error {
 	if o.ID != "" {
 		if err := validateLimiterID(o.ID); err != nil {
@@ -150,10 +158,21 @@ func (o Options) reportError(err error) {
 // Request on the legacy path and Acquire on the lease path — so both store
 // implementations reject the same inputs.
 //
+// It validates the whole Options value, not just the fields a store reads.
+// NewLimiter has always called Options.Validate, but a direct
+// Request/Acquire caller bypassed it entirely, so a negative MaxConcurrent
+// reached the store and was honored as "unlimited" — precisely the silent
+// failure Validate exists to prevent. Anything Validate rejects for a limiter is
+// rejected here too; see Options.Validate for why the scheduler-only fields are
+// included rather than filtered out.
+//
 // An empty limiter ID is not checked here: it is a problem for RedisStore, where
 // the ID becomes part of a key, and harmless for LocalStore, where it is just a
 // map key. RedisStore rejects it before calling this.
 func validateAdmission(limiterID string, weight int, opts Options) error {
+	if err := opts.Validate(); err != nil {
+		return err
+	}
 	if err := validateLimiterID(limiterID); err != nil {
 		return err
 	}
