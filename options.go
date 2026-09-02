@@ -2,11 +2,32 @@
 package gothrottle
 
 import (
+	"fmt"
 	"time"
 	"unicode"
 )
 
 const maxLimiterIDLength = 512
+
+// maxExactLuaInt is the largest integer Redis Lua represents exactly. Lua 5.1
+// numbers are IEEE-754 doubles, so 2^53-1 is the last integer whose immediate
+// successor is also representable: above it two different limits can compare
+// equal, and a limit can shift as it crosses the boundary. Redis decides
+// admission inside Lua, so a value that cannot survive the trip is rejected up
+// front rather than enforced approximately.
+//
+// Every quantity crossing into Lua is checked against it: MaxConcurrent, job
+// weights, and the durations as microsecond counts. A time.Duration tops out at
+// roughly 9.22e15µs, about 2% past this boundary, so a MinTime or LeaseTTL near
+// the very top of the Duration range is rejected too — around 285 years, which
+// no throttling configuration means.
+//
+// The constant is int64 deliberately: on a 32-bit build it does not fit in an
+// int, so values are widened for the comparison instead.
+const maxExactLuaInt int64 = 1<<53 - 1
+
+// maxInt is the largest value an int holds on the building platform.
+const maxInt = int(^uint(0) >> 1)
 
 // defaultRetryInterval is how long the scheduler waits before re-asking a
 // distributed datastore for capacity after it was refused. The release happens
@@ -105,8 +126,14 @@ func (o Options) Validate() error {
 	if o.MaxConcurrent < 0 {
 		return ErrInvalidMaxConcurrent
 	}
+	if err := checkLuaExactRange("MaxConcurrent", int64(o.MaxConcurrent)); err != nil {
+		return err
+	}
 	if o.MinTime < 0 {
 		return ErrInvalidMinTime
+	}
+	if err := checkLuaExactRange("MinTime in microseconds", o.MinTime.Microseconds()); err != nil {
+		return err
 	}
 	if o.MaxQueueSize < 0 {
 		return ErrInvalidMaxQueueSize
@@ -117,10 +144,24 @@ func (o Options) Validate() error {
 	if o.LeaseTTL < 0 {
 		return ErrInvalidLeaseTTL
 	}
+	if err := checkLuaExactRange("LeaseTTL in microseconds", o.LeaseTTL.Microseconds()); err != nil {
+		return err
+	}
 	switch o.SchedPolicy {
 	case SchedStrict, SchedBestFit:
 	default:
 		return ErrInvalidSchedPolicy
+	}
+	return nil
+}
+
+// checkLuaExactRange rejects an integer that Redis Lua cannot compare exactly.
+// Redis decides admission inside a Lua script, so a limit it can only
+// approximate is a limit that is not being enforced as written.
+func checkLuaExactRange(field string, value int64) error {
+	if value > maxExactLuaInt {
+		return fmt.Errorf("%w: %s is %d, but at most %d can be enforced exactly by the Redis Lua scripts",
+			ErrValueOutOfRange, field, value, maxExactLuaInt)
 	}
 	return nil
 }
@@ -178,6 +219,9 @@ func validateAdmission(limiterID string, weight int, opts Options) error {
 	}
 	if weight <= 0 {
 		return ErrInvalidWeight
+	}
+	if err := checkLuaExactRange("weight", int64(weight)); err != nil {
+		return err
 	}
 	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
 		// Without this the job would be refused forever with no error,

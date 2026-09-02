@@ -147,6 +147,9 @@ func (l *Limiter) schedule(ctx context.Context, task func() (interface{}, error)
 	if weight <= 0 {
 		return nil, ErrInvalidWeight
 	}
+	if err := checkLuaExactRange("weight", int64(weight)); err != nil {
+		return nil, err
+	}
 	if l.opts.MaxConcurrent > 0 && weight > l.opts.MaxConcurrent {
 		return nil, ErrWeightExceedsMax
 	}
@@ -620,7 +623,7 @@ func (l *Limiter) startJob(job *Job) bool {
 		l.mu.Unlock()
 		return false
 	}
-	l.localWeight += job.Weight
+	l.localWeight = addClamped(l.localWeight, job.Weight)
 	l.mu.Unlock()
 
 	l.workerWG.Add(1)

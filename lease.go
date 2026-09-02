@@ -189,11 +189,7 @@ const minStateWindow = time.Second
 // Correctness comes from per-lease expiry, so this only has to outlast a lease
 // nobody renews.
 func leaseStateWindow(leaseTTL time.Duration) time.Duration {
-	window := 2 * leaseTTL
-	if window < leaseTTL {
-		// Doubling overflowed; a single TTL still outlasts one lease.
-		window = leaseTTL
-	}
+	window := doubleDuration(leaseTTL)
 	if window < minStateWindow {
 		window = minStateWindow
 	}
@@ -205,10 +201,7 @@ func leaseStateWindow(leaseTTL time.Duration) time.Duration {
 // lease TTL is what previously let a released or renewed lease shorten a long
 // spacing window into oblivion.
 func spacingStateWindow(minTime time.Duration) time.Duration {
-	window := 2 * minTime
-	if window < minTime {
-		window = minTime
-	}
+	window := doubleDuration(minTime)
 	if window < minStateWindow {
 		window = minStateWindow
 	}

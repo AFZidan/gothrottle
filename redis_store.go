@@ -117,7 +117,14 @@ end
 if min_time_us > 0 and last_start > 0 then
     local elapsed = now_us - last_start
     if elapsed < min_time_us then
-        return {0, min_time_us - elapsed}
+        local wait_us = min_time_us - elapsed
+        -- A Redis clock that moved backwards would otherwise report a wait
+        -- longer than the window itself, stalling the caller past the spacing it
+        -- actually owes. The lease script clamps the same way.
+        if wait_us > min_time_us then
+            wait_us = min_time_us
+        end
+        return {0, wait_us}
     end
 end
 
@@ -208,11 +215,10 @@ func parseRequestReply(reply interface{}) (canRun bool, waitTime time.Duration, 
 	}
 
 	// A negative wait means the refusal has no deadline: capacity is held, and
-	// only another instance releasing it can change the outcome.
-	if waitUS > 0 {
-		waitTime = time.Duration(waitUS) * time.Microsecond
-	}
-	return admitted == 1, waitTime, nil
+	// only another instance releasing it can change the outcome. A positive one
+	// is clamped on conversion, so a nonsense reply cannot wrap into a negative
+	// Duration that the scheduler would read as "no deadline at all".
+	return admitted == 1, microsToDuration(waitUS), nil
 }
 
 // evalScript runs the admission script, falling back to EVAL if Redis has
@@ -248,12 +254,16 @@ func (rs *RedisStore) evalScript(limiterID string, args []interface{}) (interfac
 // must outlast the spacing window: a MinTime longer than the TTL would
 // otherwise be bypassed entirely once the key expired.
 //
+// The doubling saturates rather than wrapping. A MinTime past half the Duration
+// range would otherwise produce a negative TTL, which reads as "shorter than the
+// default" and would leave the window unprotected — the opposite of the intent.
+//
 // This does not fix the underlying flaw — a job that runs longer than the TTL
 // still has its state expire while it is running, which is what tokenized
 // leases address.
 func (rs *RedisStore) stateTTL(opts Options) time.Duration {
 	ttl := defaultStateTTL
-	if minimum := 2 * opts.MinTime; minimum > ttl {
+	if minimum := doubleDuration(opts.MinTime); minimum > ttl {
 		ttl = minimum
 	}
 	return ttl

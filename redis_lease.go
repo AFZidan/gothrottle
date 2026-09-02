@@ -499,11 +499,9 @@ func parseAcquireReply(reply interface{}, limiterID string, weight int, token st
 		if err != nil {
 			return nil, 0, fmt.Errorf("unexpected redis acquire result: %w", err)
 		}
-		var retryAfter time.Duration
-		if waitUS > 0 {
-			retryAfter = time.Duration(waitUS) * time.Microsecond
-		}
-		return nil, retryAfter, nil
+		// Clamped on conversion: a nonsense reply must not wrap into a negative
+		// Duration, which the scheduler reads as "no deadline" and stops waiting on.
+		return nil, microsToDuration(waitUS), nil
 	}
 
 	expiresUS, err := toInt64(values[1])
@@ -516,7 +514,7 @@ func parseAcquireReply(reply interface{}, limiterID string, weight int, token st
 		LimiterID: limiterID,
 		Weight:    weight,
 		TTL:       ttl,
-		ExpiresAt: time.Unix(0, expiresUS*int64(time.Microsecond)),
+		ExpiresAt: microsToTime(expiresUS),
 	}, 0, nil
 }
 
@@ -578,7 +576,7 @@ func (rs *RedisStore) Renew(ctx context.Context, lease *Lease) error {
 		return ErrLeaseLost
 	}
 
-	lease.ExpiresAt = time.Unix(0, expiresUS*int64(time.Microsecond))
+	lease.ExpiresAt = microsToTime(expiresUS)
 	return nil
 }
 
