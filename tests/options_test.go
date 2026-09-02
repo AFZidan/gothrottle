@@ -37,6 +37,14 @@ func TestOptions_RejectsNegativeLimits(t *testing.T) {
 			want: gothrottle.ErrInvalidRetryInterval,
 		},
 		{
+			// LeaseTTL had a sentinel and a Validate check but no test. A negative
+			// value falls through leaseTTL()'s `<= 0` branch to the 30s default, so
+			// the mistake would be silently corrected rather than reported.
+			name: "negative LeaseTTL",
+			opts: gothrottle.Options{LeaseTTL: -time.Second},
+			want: gothrottle.ErrInvalidLeaseTTL,
+		},
+		{
 			name: "unknown SchedPolicy",
 			opts: gothrottle.Options{SchedPolicy: gothrottle.SchedPolicy(42)},
 			want: gothrottle.ErrInvalidSchedPolicy,
