@@ -142,11 +142,16 @@ type Options struct {
 }
 ```
 
-Negative values for `MaxConcurrent`, `MinTime`, `MaxQueueSize` or
-`RetryInterval` are rejected by `NewLimiter` rather than being treated as
-"unlimited" — a miscalculated limit fails loudly instead of silently switching
+Negative values for `MaxConcurrent`, `MinTime`, `MaxQueueSize`, `RetryInterval`
+or `LeaseTTL` are rejected rather than being treated as "unlimited" or "use the
+default" — a miscalculated limit fails loudly instead of silently switching
 throttling off. Zero keeps its meaning of "no limit" or "use the default". You
-can also call `opts.Validate()` yourself.
+can call `opts.Validate()` yourself, and every admission path runs it: see
+[Validation applies to direct datastore calls](#validation-applies-to-direct-datastore-calls).
+
+`MaxConcurrent` and job weights are also capped at 2^53-1, and `MinTime` and
+`LeaseTTL` at 2^53-1 microseconds (about 285 years). See [Numeric
+limits](#numeric-limits).
 
 ### Scheduling
 
@@ -170,6 +175,33 @@ for the free capacity:
 `RetryInterval` only applies to distributed setups: when a shared store refuses
 capacity, the release happens in another process and produces no local event, so
 the scheduler re-checks on this interval.
+
+#### `SchedBestFit` with a shared store
+
+Best fit works against the capacity the *store* has, not just what this limiter
+is running. That distinction matters because a limiter cannot see another
+process's reservations: its own running weight can be zero while the shared limit
+is fully committed elsewhere.
+
+So when the store refuses a job for capacity, `SchedBestFit` treats the refusal
+as information — that weight does not fit, therefore nothing at least as heavy
+does either — and looks for a strictly lighter queued job in the same dispatch
+pass. With a shared `MaxConcurrent` of 3, one process holding weight 2, and a
+queue holding a high-priority weight-2 job ahead of a weight-1 job, the weight-1
+job runs; the weight-2 job waits for capacity and runs when it frees up.
+
+Three properties bound the behavior:
+
+- Each refusal lowers the ceiling strictly, so every attempt in a pass is for a
+  lighter job than the last. A pass cannot retry the same job or spin.
+- A refused job keeps its sequence number, so priority and FIFO order among
+  equal-priority jobs are unaffected by having been held back.
+- A `MinTime` refusal ends the pass. Spacing gates the limiter rather than one
+  job, so no lighter job could start either, and asking would only spend
+  datastore round trips.
+
+Under `SchedStrict` a refusal still ends the pass immediately: the head job holds
+the queue until the store admits it.
 
 ### Limiter Methods
 
@@ -321,11 +353,61 @@ closes the client, for when the store is its sole user.
   registered this limiter ID with a different `MaxConcurrent`, `MinTime` or
   `LeaseTTL`. See [Same-ID configuration consistency](#same-id-configuration-consistency).
 - `ErrInvalidMaxConcurrent`, `ErrInvalidMinTime`, `ErrInvalidMaxQueueSize`,
-  `ErrInvalidRetryInterval`, `ErrInvalidSchedPolicy`: returned by `NewLimiter`
-  and `Options.Validate` for negative or unknown configuration values.
+  `ErrInvalidRetryInterval`, `ErrInvalidLeaseTTL`, `ErrInvalidSchedPolicy`:
+  returned by `NewLimiter`, `Options.Validate` and every datastore admission call
+  for negative or unknown configuration values.
+- `ErrValueOutOfRange`: returned when `MaxConcurrent`, a job weight, or `MinTime`
+  or `LeaseTTL` in microseconds exceeds what Redis Lua can compare exactly. See
+  [Numeric limits](#numeric-limits).
 - `ErrNilClient`: returned by `NewRedisStore(nil)`, including a typed nil such as
   `(*redis.Client)(nil)`. It unwraps to `ErrStoreClosed`, which is what earlier
   versions returned.
+
+#### Validation applies to direct datastore calls
+
+`Datastore` and `LeaseDatastore` are exported, so `Request`, `Acquire`,
+`RegisterDone`, `Renew` and `Release` can be called without a limiter. Those
+calls enforce the same rules `NewLimiter` does.
+
+`Request` and `Acquire` run `Options.Validate()` in full and additionally reject a
+non-positive weight, a weight above a positive `MaxConcurrent`, an out-of-range
+weight, and a malformed limiter ID — plus an empty ID for `RedisStore`, where the
+ID becomes part of a key. Validation happens before anything is generated or
+written: no lease token, no Redis command, no local state, no configuration
+registration, and no change to a TTL or the spacing record. A rejected call leaves
+the store exactly as it was.
+
+`Options.Validate()` is applied whole, including the three fields no store reads —
+`SchedPolicy`, `RetryInterval` and `MaxQueueSize`. They shape how one process
+queues its own work, so a store has no use for them, but a negative
+`RetryInterval` is a configuration mistake wherever it appears, and one validator
+with one behavior is easier to rely on than a store-specific subset where which
+mistakes get caught depends on which entry point was used.
+
+`RegisterDone` is deliberately narrower: it carries no `Options`, so only the
+limiter ID and weight are checked.
+
+#### Numeric limits
+
+Redis decides admission inside a Lua script, and Lua 5.1 numbers are IEEE-754
+doubles: integers are exact only up to 2^53-1. Past that boundary two different
+limits can compare equal, and a limit can shift as it crosses it — the limit being
+enforced would not be the limit that was configured. Rather than enforce a limit
+approximately, values that cannot survive the trip are rejected with
+`ErrValueOutOfRange`:
+
+| Value | Maximum |
+| --- | --- |
+| `MaxConcurrent` | 2^53-1 (9,007,199,254,740,991) |
+| Job weight | 2^53-1 |
+| `MinTime` | 2^53-1 microseconds (~285 years) |
+| `LeaseTTL` | 2^53-1 microseconds |
+
+Everything below those bounds is exact. Arithmetic on values that pass validation
+saturates rather than wrapping — the doubled state windows, running-weight sums —
+because a wrapped negative would read as a shorter window or as free capacity,
+and capacity comparisons are written as subtraction against the limit so no sum
+is formed that could exceed `int` on a 32-bit build.
 
 ### Storage Backends
 
@@ -351,7 +433,9 @@ yours. Use `Close()` when the store is the only user of the client.
 
 `NewRedisStore` takes go-redis's `redis.UniversalClient`, which `*redis.Client`
 satisfies — so the call above is unchanged — as do `*redis.ClusterClient`,
-`*redis.Ring` and the Sentinel-backed failover client. A typed nil such as
+`*redis.Ring` and the Sentinel-backed failover client. They compile and construct;
+what the tests actually demonstrate for each is set out under [Cluster, Ring and
+Sentinel support status](#redis-key-layout). A typed nil such as
 `(*redis.Client)(nil)` is rejected with `ErrNilClient` rather than accepted and
 panicked on later.
 
@@ -405,10 +489,61 @@ the four names if you need to inspect or clear state operationally.
 The legacy `Request`/`RegisterDone` path uses a single `gothrottle:<id>` hash,
 available as `RedisStateKey(id)`. It needs no tag, being single-key.
 
-**Cluster support status.** The key scheme is cluster-slot ready and
-`NewRedisStore` accepts a `*redis.ClusterClient`, but the combination is not
-covered by the test suite, which runs against standalone Redis 6 and 7. Treat
-standalone and Sentinel as supported, and Cluster as untested.
+##### Orphan reconciliation
+
+Two keys describe one reservation: a weight in the lease hash and an expiry score
+in the ZSET. The scripts always write both together, so a mismatch is state this
+package did not produce — a partial restore, a manual `HDEL`, an AOF truncated
+between the two commands. It has to be survivable, because a weight the expiry
+path can never reclaim would hold capacity until someone noticed by hand.
+
+For a limiter with a positive `MaxConcurrent`, every acquisition reconciles by
+membership. The expiry ZSET is authoritative for liveness, so the running weight
+is summed by walking it and reading each token's weight. That gives three
+guarantees:
+
+- A weight in the hash with no expiry entry is never counted, and is removed.
+- An expiry entry with no weight is removed, so it cannot accumulate.
+- A live lease is untouched: its weight still counts and it stays renewable.
+
+The work is bounded. Members are read and deleted in batches, so no `unpack()`
+approaches Lua's argument limit however much corruption has accumulated. The cost
+is one `ZRANGE` plus one `HMGET` per 256 live leases — and live leases are bounded
+by `MaxConcurrent`, since each weighs at least 1. The lease hash is only scanned
+(`HKEYS`) when the counts still disagree after that, which is exactly when it
+holds an orphan; a healthy limiter never scans it.
+
+With `MaxConcurrent` at 0 the guarantee is narrower, deliberately. There is no
+limit for an orphan to consume, so orphan state costs memory rather than
+correctness — and the lease hash is not bounded by anything, so walking it on
+every admission would be an unbounded cost paid by the configuration that needs it
+least. An unlimited limiter therefore reconciles only when the O(1) cardinality
+check shows a disagreement. Equal-cardinality corruption is left in place; it
+blocks nothing, and the keys carry a TTL of twice the lease window, so one idle
+window clears them.
+
+`last-start` is never touched by reconciliation. Spacing is measured from when a
+job started, so that record is not reservation state — see [Spacing outlives
+reservations](#spacing-outlives-reservations).
+
+**Cluster, Ring and Sentinel support status.** `NewRedisStore` takes
+`redis.UniversalClient`, so a `*redis.ClusterClient`, a `*redis.Ring` and the
+Sentinel-backed failover client all compile and construct. What the test suite
+demonstrates is narrower than that, and the distinction is worth stating exactly:
+
+| Configuration | Status |
+| --- | --- |
+| Standalone (Redis 6 and 7) | Covered by every Redis test in CI on both versions. |
+| `*redis.Ring` | One test exercises acquire, renew, release, the concurrency limit and the legacy path through a single-node Ring. Multi-node sharding is not tested. |
+| `*redis.ClusterClient` | Constructor and typed-nil handling only. No test runs against a real cluster. |
+| Sentinel failover client | Not exercised by any test. |
+
+The key layout is designed to be cluster-safe: all four keys for a limiter share
+one hash tag, so the multi-key Lua scripts stay in a single slot, and the lease
+scripts recover from `NOSCRIPT` with `EVAL`, which caches on whichever node serves
+the key. That is a design property, not a tested one. Treat standalone as
+supported; treat Cluster, multi-node Ring and Sentinel as untested until a real
+multi-node test exists.
 
 ## Architecture
 
@@ -500,6 +635,7 @@ gothrottle/
 ├── redis_store.go     # Redis-based storage implementation
 ├── redis_lease.go     # Redis lease implementation and Lua scripts
 ├── limiter.go         # Main Limiter struct and logic
+├── bounds.go          # Numeric policy: exact ranges and saturating arithmetic
 ├── errors.go          # Common error definitions and PanicError
 ├── assets/            # Visual assets and branding
 │   ├── logo.svg                 # Vector logo
@@ -514,12 +650,15 @@ gothrottle/
 │   ├── shutdown_test.go         # Shutdown and datastore ownership
 │   ├── cancellation_test.go     # Shutdown cancellation of store operations
 │   ├── options_test.go          # Configuration validation
+│   ├── store_validation_test.go # Direct datastore validation and numeric bounds
+│   ├── bestfit_test.go          # SchedBestFit against distributed capacity
 │   ├── context_test.go          # Context cancellation and error reporting
 │   ├── lease_test.go            # Lease contract, both stores
 │   ├── spacing_test.go          # MinTime independence from lease lifecycle
 │   ├── legacy_state_test.go     # Request/RegisterDone state and TTL behavior
 │   ├── config_consistency_test.go # Same-ID configuration agreement
 │   ├── redis_keys_test.go       # Key layout, hash tags, client types
+│   ├── redis_orphan_test.go     # Orphan reconciliation and bounded repair
 │   ├── adversarial_test.go      # Failure-scenario coverage
 │   ├── integration_test.go      # Integration tests and benchmarks
 │   ├── redis_helpers_test.go    # Redis test helpers
@@ -528,7 +667,7 @@ gothrottle/
 ├── .github/           # GitHub workflows and templates
 │   ├── workflows/
 │   │   ├── ci.yml                # CI/CD pipeline
-│   │   ├── release.yml           # Release automation
+│   │   ├── release.yml           # Gated, idempotent release (workflow_dispatch)
 │   │   └── codeql.yml           # Security analysis
 │   ├── ISSUE_TEMPLATE/
 │   │   ├── bug_report.md
@@ -664,6 +803,60 @@ go test -v -race -coverprofile=coverage.out -coverpkg=./... ./tests/...
 # Test a specific function
 go test ./tests/... -run TestLimiter_MaxConcurrent -v
 ```
+
+## Releasing
+
+There is one authoritative release path: the `Release` workflow, triggered
+manually. Pushing a tag does not release anything.
+
+```bash
+# Release the current tip of main
+gh workflow run release.yml -f version=v1.1.1
+
+# Or release an exact commit
+gh workflow run release.yml -f version=v1.1.1 -f commit=<sha>
+
+# Verify everything without creating a tag or a release
+gh workflow run release.yml -f version=v1.1.1 -f dry_run=true
+```
+
+The workflow verifies before it publishes, in this order:
+
+1. The version is a valid `vMAJOR.MINOR.PATCH` semantic version tag.
+2. The commit exists and is an ancestor of `main`.
+3. If the tag already exists, it points at that same commit — otherwise the run
+   fails rather than moving a published tag.
+4. Every check run for the commit has completed successfully, and no commit status
+   is failing.
+5. The module path can carry this major version.
+6. `go vet`, the `gofmt -s` check, the full suite under `-race` against Redis with
+   `REQUIRE_REDIS=true`, a confirmation that Redis tests actually executed rather
+   than skipped, and the cross-platform builds all pass — run against the exact
+   commit being released, not against whatever `main` has moved on to.
+
+Only then does the `publish` job create the tag and the release, and the Go proxy
+warm-up runs after it.
+
+Re-running is safe. An existing tag at the same commit is reused, never moved or
+recreated; an existing release is inspected rather than recreated, so the Go proxy
+warm-up still runs instead of being skipped by a failure. Two release runs cannot
+overlap: a `concurrency: release` group makes the second wait.
+
+Least privilege applies throughout — the workflow is `contents: read` and only the
+`publish` job takes `contents: write`.
+
+### Why the historical v1.1.0 Release run is red
+
+The `v1.1.0` release was created by hand, then the old tag-triggered workflow ran
+and called `gh release create` for a release that already existed, which failed
+with `Release.tag_name already exists`. The dependent Go proxy job was skipped as
+a result. Its Redis race tests had passed; nothing about `v1.1.0`'s contents is in
+question.
+
+That run is left as it is. The tag and release are published artifacts that
+consumers may already have resolved, and re-tagging to make an old workflow run
+green would change what `go get` at that version means. The workflow that produced
+it has been replaced, so the failure mode cannot recur.
 
 ## License
 
