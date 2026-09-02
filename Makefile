@@ -1,7 +1,7 @@
 # GoThrottle Makefile
 # Common development commands for the GoThrottle rate limiting library
 
-.PHONY: help build test test-race test-cover test-bench clean fmt lint vet security deps verify install cross-build docker-test docker-test-down redis-up redis-down test-redis coverage-html coverage-check mod-tidy
+.PHONY: help build test test-race test-cover test-bench clean fmt lint lint-workflows vet security deps verify install cross-build docker-test docker-test-down redis-up redis-down test-redis coverage-html coverage-check mod-tidy
 
 # Default target
 .DEFAULT_GOAL := help
@@ -18,6 +18,7 @@ MIN_COVERAGE := 60
 # Tool versions - keep in sync with .github/workflows/ci.yml and Dockerfile.test
 GOLANGCI_LINT_VERSION := v1.59.1
 GOSEC_VERSION := v2.20.0
+ACTIONLINT_VERSION := v1.7.7
 
 # Prefer the Compose v2 plugin, fall back to the standalone v1 binary
 COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi)
@@ -144,6 +145,18 @@ lint: ## Run golangci-lint
 	fi
 	@echo "$(GREEN)✓ Linting passed$(NC)"
 
+lint-workflows: ## Lint GitHub Actions workflows with actionlint
+	@echo "$(BLUE)Linting workflows...$(NC)"
+	@if command -v actionlint >/dev/null 2>&1; then \
+		actionlint; \
+	elif [ -f "$(GOPATH)/bin/actionlint" ]; then \
+		$(GOPATH)/bin/actionlint; \
+	else \
+		echo "$(RED)actionlint not installed. Run: make install-tools$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)✓ Workflows linted$(NC)"
+
 security: ## Run security scan with gosec
 	@echo "$(BLUE)Running security scan...$(NC)"
 	@if command -v gosec >/dev/null 2>&1; then \
@@ -157,7 +170,7 @@ security: ## Run security scan with gosec
 	@echo "$(GREEN)✓ Security scan completed$(NC)"
 
 # Quality gate - run all checks
-quality: fmt-check vet lint security ## Run all quality checks (format, vet, lint, security)
+quality: fmt-check vet lint lint-workflows security ## Run all quality checks (format, vet, lint, workflows, security)
 	@echo "$(GREEN)✓ All quality checks passed!$(NC)"
 
 # Dependency management
@@ -189,6 +202,8 @@ install-tools: ## Install development tools (pinned versions)
 	go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	@echo "$(YELLOW)Installing gosec $(GOSEC_VERSION)...$(NC)"
 	go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)
+	@echo "$(YELLOW)Installing actionlint $(ACTIONLINT_VERSION)...$(NC)"
+	go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 	@echo "$(GREEN)✓ Development tools installed$(NC)"
 
 # Docker commands
