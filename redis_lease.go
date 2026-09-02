@@ -64,6 +64,90 @@ local function ensure_ttl(key, ttl_ms)
 end
 `
 
+// redisReconcileHelper computes a limiter's running weight and, on the way,
+// repairs reservation records that the normal expiry path can never reclaim.
+//
+// The expiry ZSET is authoritative for liveness, so the sum walks it rather than
+// the lease hash. That inverts the old failure: a weight in the hash with no
+// expiry entry is simply never counted, instead of consuming capacity forever.
+// Removing the expiry entries that have no weight then leaves the ZSET a subset
+// of the hash, which is what makes the cardinality comparison exact — comparing
+// counts alone was the defect, because a hash holding token A and a ZSET holding
+// token B both have one member and nothing was reconciled.
+//
+// Everything is bounded. Members are read and deleted in batches of
+// reconcile_batch so no unpack() can approach Lua's argument limit, and the hash
+// is scanned only when the counts still disagree, which is exactly when it holds
+// an orphan.
+const redisReconcileHelper = `
+local reconcile_batch = 256
+
+local function del_in_batches(cmd, key, members)
+    local i = 1
+    while i <= #members do
+        local last = i + reconcile_batch - 1
+        if last > #members then
+            last = #members
+        end
+        local batch = {}
+        for j = i, last do
+            batch[#batch + 1] = members[j]
+        end
+        redis.call(cmd, key, unpack(batch))
+        i = last + 1
+    end
+end
+
+local function running_weight(lease_key, exp_key)
+    local live = redis.call("ZRANGE", exp_key, 0, -1)
+    local running = 0
+    local orphans = {}
+    local tracked = {}
+
+    local i = 1
+    while i <= #live do
+        local last = i + reconcile_batch - 1
+        if last > #live then
+            last = #live
+        end
+        local batch = {}
+        for j = i, last do
+            batch[#batch + 1] = live[j]
+            tracked[live[j]] = true
+        end
+        local weights = redis.call("HMGET", lease_key, unpack(batch))
+        for j = 1, #batch do
+            local weight = tonumber(weights[j])
+            if weight and weight > 0 then
+                running = running + weight
+            else
+                -- No weight, or one this package never writes. Neither record
+                -- can describe a live reservation, so both go.
+                orphans[#orphans + 1] = batch[j]
+            end
+        end
+        i = last + 1
+    end
+    del_in_batches("ZREM", exp_key, orphans)
+    del_in_batches("HDEL", lease_key, orphans)
+
+    -- Every surviving expiry entry now has a weight, so a count mismatch means
+    -- the hash holds fields the ZSET does not.
+    if redis.call("HLEN", lease_key) ~= redis.call("ZCARD", exp_key) then
+        local stale = {}
+        local fields = redis.call("HKEYS", lease_key)
+        for j = 1, #fields do
+            if not tracked[fields[j]] then
+                stale[#stale + 1] = fields[j]
+            end
+        end
+        del_in_batches("HDEL", lease_key, stale)
+    end
+
+    return running
+end
+`
+
 // redisAcquireScript checks configuration agreement, reclaims expired leases,
 // then admits or refuses the request.
 //
@@ -77,7 +161,7 @@ end
 //	{0, 0, -1}                                    refused, capacity held
 //	{0, 0, wait_us}                               refused, retry after wait_us
 //	{-1, max, min_time_us, lease_ttl_us, id}      configuration mismatch
-const redisAcquireScript = redisEnsureTTLHelper + `
+const redisAcquireScript = redisEnsureTTLHelper + redisReconcileHelper + `
 local lease_key = KEYS[1]
 local exp_key = KEYS[2]
 local start_key = KEYS[3]
@@ -136,37 +220,18 @@ while true do
 end
 
 -- Running weight is summed from the live leases, so it cannot drift out of step
--- with the reservations it represents. The reclaim loop above has just removed
--- everything lapsed, and the hash and the expiry set are always written
--- together, so the hash holds exactly the live leases — bounded by
--- max_concurrent, since each weighs at least 1.
---
--- The length comparison reconciles state this package did not write: after a
--- partial restore or manual surgery, a hash field could outlive its expiry entry
--- and hold capacity forever. It costs one comparison when nothing is wrong.
+-- with the reservations it represents. See redisReconcileHelper for how orphaned
+-- records are reconciled while summing.
 if max_concurrent > 0 then
-    if redis.call("HLEN", lease_key) ~= redis.call("ZCARD", exp_key) then
-        local tracked = {}
-        local live = redis.call("ZRANGE", exp_key, 0, -1)
-        for i = 1, #live do
-            tracked[live[i]] = true
-        end
-        local fields = redis.call("HKEYS", lease_key)
-        for i = 1, #fields do
-            if not tracked[fields[i]] then
-                redis.call("HDEL", lease_key, fields[i])
-            end
-        end
-    end
-
-    local running = 0
-    local held = redis.call("HGETALL", lease_key)
-    for i = 2, #held, 2 do
-        running = running + tonumber(held[i])
-    end
-    if running + weight > max_concurrent then
+    if running_weight(lease_key, exp_key) + weight > max_concurrent then
         return {0, 0, -1}
     end
+elseif redis.call("HLEN", lease_key) ~= redis.call("ZCARD", exp_key) then
+    -- With no concurrency limit there is no capacity for an orphan to hold, so
+    -- one costs memory rather than correctness. Reconcile only when the counts
+    -- disagree: an unlimited limiter must not pay for a membership walk on every
+    -- admission.
+    running_weight(lease_key, exp_key)
 end
 
 if min_time_us > 0 then
