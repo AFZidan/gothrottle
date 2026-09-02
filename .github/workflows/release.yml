@@ -46,6 +46,15 @@ jobs:
   verify:
     name: Verify release candidate
     runs-on: ubuntu-latest
+    # Read-only, but wider than the workflow default: a workflow-level
+    # `permissions:` block sets every scope it omits to none, and this job needs
+    # the Actions API (to identify its own check suite), the Checks API and commit
+    # statuses.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      statuses: read
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       sha: ${{ steps.resolve.outputs.sha }}
@@ -323,6 +332,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Fetch main and tags
+        run: |
+          # The workflow can be dispatched from any ref, so the commit being
+          # released is not guaranteed to be in the checked-out history.
+          git fetch --force origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --tags origin
+
       - name: Create the tag
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -334,11 +350,20 @@ jobs:
           # so this is either the first push or a no-op re-run. Never --force:
           # moving a published tag changes what an already-resolved module
           # version means to every consumer that cached it.
-          existing=$(git ls-remote --tags origin "refs/tags/$VERSION" | awk '{print $1}')
+          #
+          # ls-remote also returns the peeled `^{}` ref for an annotated tag, so
+          # only the first line is of interest.
+          existing=$(git ls-remote --tags origin "refs/tags/$VERSION" | awk 'NR==1 {print $1}')
           if [ -n "$existing" ]; then
             echo "Tag $VERSION is already on origin at $existing; leaving it untouched."
             exit 0
           fi
+
+          # An annotated tag needs a committer identity, and actions/checkout does
+          # not configure one. Set it locally rather than globally so nothing else
+          # in the job inherits it.
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
           git tag -a "$VERSION" "$SHA" -m "Release $VERSION"
           git push origin "refs/tags/$VERSION"
@@ -367,6 +392,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.verify.outputs.version }}
+          SHA: ${{ needs.verify.outputs.sha }}
           RELEASE_EXISTS: ${{ needs.verify.outputs.release_exists }}
         run: |
           set -euo pipefail
@@ -381,8 +407,12 @@ jobs:
             exit 0
           fi
 
+          # --target takes a branch or a full commit SHA, so it is the verified
+          # SHA rather than the tag name. The tag already exists at that commit,
+          # so this only names where the release points if the tag were somehow
+          # absent.
           gh release create "$VERSION" \
-            --target "$VERSION" \
+            --target "$SHA" \
             --title "Release $VERSION" \
             --notes-file release_notes.md
           echo "OK: created release $VERSION"
