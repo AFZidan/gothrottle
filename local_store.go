@@ -30,18 +30,8 @@ func NewLocalStore() *LocalStore {
 
 // Request checks if a job can run according to the limiter's rules.
 func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRun bool, waitTime time.Duration, err error) {
-	// Validated on the same terms as RedisStore so both implementations of the
-	// interface reject the same inputs.
-	if err := validateLimiterID(limiterID); err != nil {
+	if err := validateAdmission(limiterID, weight, opts); err != nil {
 		return false, 0, err
-	}
-	if weight <= 0 {
-		return false, 0, ErrInvalidWeight
-	}
-	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
-		// Without this the job would be refused forever with canRun=false and
-		// no error, spinning in the scheduler's requeue loop.
-		return false, 0, ErrWeightExceedsMax
 	}
 
 	ls.mu.Lock()
@@ -53,21 +43,16 @@ func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRu
 
 	state, exists := ls.state[limiterID]
 	if !exists {
-		state = &LocalState{
-			running:   0,
-			lastStart: time.Time{},
-		}
+		state = &LocalState{}
 		ls.state[limiterID] = state
 	}
 
 	now := time.Now()
 
-	// Check max concurrent limit
 	if opts.MaxConcurrent > 0 && state.running+weight > opts.MaxConcurrent {
 		return false, 0, nil
 	}
 
-	// Check min time between jobs
 	if opts.MinTime > 0 && !state.lastStart.IsZero() {
 		elapsed := now.Sub(state.lastStart)
 		if elapsed < opts.MinTime {
@@ -76,7 +61,6 @@ func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRu
 		}
 	}
 
-	// Job can run - update state
 	state.running += weight
 	state.lastStart = now
 
@@ -85,11 +69,8 @@ func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRu
 
 // RegisterDone informs the store that a job has finished.
 func (ls *LocalStore) RegisterDone(limiterID string, weight int) error {
-	if err := validateLimiterID(limiterID); err != nil {
+	if err := validateCompletion(limiterID, weight); err != nil {
 		return err
-	}
-	if weight <= 0 {
-		return ErrInvalidWeight
 	}
 
 	ls.mu.Lock()
@@ -101,7 +82,9 @@ func (ls *LocalStore) RegisterDone(limiterID string, weight int) error {
 
 	state, exists := ls.state[limiterID]
 	if !exists {
-		return nil // Nothing to do
+		// Nothing was ever admitted under this ID, so there is no reservation to
+		// return. Reporting an error would only invite a retry that cannot help.
+		return nil
 	}
 
 	state.running -= weight

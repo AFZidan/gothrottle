@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -43,9 +44,12 @@ const (
 	redisKeyPrefix = "gothrottle:"
 )
 
-// leaseTTLHelper is the TTL discipline shared by every lease script: extend a
-// key's expiry, never shorten it, and never resurrect one that is already gone.
-const leaseTTLHelper = `
+// redisEnsureTTLHelper is the TTL discipline every script in this package
+// shares: extend a key's expiry, never shorten it, and never resurrect one that
+// is already gone. Both the lease scripts and the legacy counter scripts include
+// it, because both had the same defect — an operation that knows only its own
+// short window must not cut short a key protecting a longer one.
+const redisEnsureTTLHelper = `
 local function ensure_ttl(key, ttl_ms)
     if ttl_ms <= 0 then
         return
@@ -73,7 +77,7 @@ end
 //	{0, 0, -1}                                    refused, capacity held
 //	{0, 0, wait_us}                               refused, retry after wait_us
 //	{-1, max, min_time_us, lease_ttl_us, id}      configuration mismatch
-const redisAcquireScript = leaseTTLHelper + `
+const redisAcquireScript = redisEnsureTTLHelper + `
 local lease_key = KEYS[1]
 local exp_key = KEYS[2]
 local start_key = KEYS[3]
@@ -218,7 +222,7 @@ end
 // KEYS:  1 lease hash, 2 expiry zset, 3 config hash
 // ARGV:  1 token, 2 lease_ttl_us, 3 lease_key_ttl_ms
 // Reply: new expiry in microseconds, or 0 when the lease is gone.
-const redisRenewScript = leaseTTLHelper + leaseConfigTTLHelper + `
+const redisRenewScript = redisEnsureTTLHelper + leaseConfigTTLHelper + `
 local lease_key = KEYS[1]
 local exp_key = KEYS[2]
 local config_key = KEYS[3]
@@ -257,7 +261,7 @@ return expires_us
 // KEYS:  1 lease hash, 2 expiry zset, 3 config hash
 // ARGV:  1 token, 2 lease_key_ttl_ms
 // Reply: 1 if the lease was held, 0 if it had already been reclaimed.
-const redisReleaseScript = leaseTTLHelper + leaseConfigTTLHelper + `
+const redisReleaseScript = redisEnsureTTLHelper + leaseConfigTTLHelper + `
 local lease_key = KEYS[1]
 local exp_key = KEYS[2]
 local config_key = KEYS[3]
@@ -375,14 +379,8 @@ func (rs *RedisStore) Acquire(ctx context.Context, limiterID string, weight int,
 	if limiterID == "" {
 		return nil, 0, ErrMissingID
 	}
-	if err := validateLimiterID(limiterID); err != nil {
+	if err := validateAdmission(limiterID, weight, opts); err != nil {
 		return nil, 0, err
-	}
-	if weight <= 0 {
-		return nil, 0, ErrInvalidWeight
-	}
-	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
-		return nil, 0, ErrWeightExceedsMax
 	}
 
 	token, err := newLeaseToken()
@@ -407,6 +405,13 @@ func (rs *RedisStore) Acquire(ctx context.Context, limiterID string, weight int,
 		return nil, 0, err
 	}
 
+	return parseAcquireReply(reply, limiterID, weight, token, ttl, config)
+}
+
+// parseAcquireReply decodes the acquire script's reply: an admission with the
+// new lease, a refusal with an optional bounded wait, or a configuration
+// mismatch naming the registered configuration.
+func parseAcquireReply(reply interface{}, limiterID string, weight int, token string, ttl time.Duration, requested leaseConfig) (*Lease, time.Duration, error) {
 	values, ok := reply.([]interface{})
 	if !ok || len(values) < 3 {
 		return nil, 0, fmt.Errorf("unexpected redis acquire result format")
@@ -421,24 +426,24 @@ func (rs *RedisStore) Acquire(ctx context.Context, limiterID string, weight int,
 		if err != nil {
 			return nil, 0, err
 		}
-		return nil, 0, configMismatchError(limiterID, config, stored, storedID)
-	}
-
-	expiresUS, err := toInt64(values[1])
-	if err != nil {
-		return nil, 0, fmt.Errorf("unexpected redis acquire result: %w", err)
-	}
-	waitUS, err := toInt64(values[2])
-	if err != nil {
-		return nil, 0, fmt.Errorf("unexpected redis acquire result: %w", err)
+		return nil, 0, configMismatchError(limiterID, requested, stored, storedID)
 	}
 
 	if granted != 1 {
+		waitUS, err := toInt64(values[2])
+		if err != nil {
+			return nil, 0, fmt.Errorf("unexpected redis acquire result: %w", err)
+		}
 		var retryAfter time.Duration
 		if waitUS > 0 {
 			retryAfter = time.Duration(waitUS) * time.Microsecond
 		}
 		return nil, retryAfter, nil
+	}
+
+	expiresUS, err := toInt64(values[1])
+	if err != nil {
+		return nil, 0, fmt.Errorf("unexpected redis acquire result: %w", err)
 	}
 
 	return &Lease{
@@ -472,7 +477,7 @@ func storedLeaseConfig(values []interface{}) (leaseConfig, string, error) {
 	storedID, _ := values[4].(string)
 
 	return leaseConfig{
-		maxConcurrent: int(maxConcurrent),
+		maxConcurrent: maxConcurrent,
 		minTimeUS:     minTimeUS,
 		leaseTTLUS:    leaseTTLUS,
 	}, storedID, nil
@@ -571,8 +576,8 @@ func toInt64(value interface{}) (int64, error) {
 	case int:
 		return int64(v), nil
 	case string:
-		var parsed int64
-		if _, err := fmt.Sscanf(v, "%d", &parsed); err != nil {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
 			return 0, fmt.Errorf("value %q is not an integer", v)
 		}
 		return parsed, nil

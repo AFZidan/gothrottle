@@ -338,34 +338,20 @@ type redisState struct {
 func redisSnapshot(t *testing.T, client *redis.Client, keys gothrottle.RedisKeyLayout) redisState {
 	t.Helper()
 
-	ctx := context.Background()
-
-	count, err := client.HLen(ctx, keys.Leases).Result()
+	count, err := client.HLen(context.Background(), keys.Leases).Result()
 	if err != nil {
 		t.Fatalf("HLEN failed: %v", err)
 	}
-	lastStart, err := client.Get(ctx, keys.LastStart).Result()
+	lastStart, err := client.Get(context.Background(), keys.LastStart).Result()
 	if err != nil {
 		t.Fatalf("GET last-start failed: %v", err)
-	}
-	leaseTTL, err := client.PTTL(ctx, keys.Leases).Result()
-	if err != nil {
-		t.Fatalf("PTTL leases failed: %v", err)
-	}
-	startTTL, err := client.PTTL(ctx, keys.LastStart).Result()
-	if err != nil {
-		t.Fatalf("PTTL last-start failed: %v", err)
-	}
-	configTTL, err := client.PTTL(ctx, keys.Config).Result()
-	if err != nil {
-		t.Fatalf("PTTL config failed: %v", err)
 	}
 
 	return redisState{
 		leaseCount: count,
 		lastStart:  lastStart,
-		leaseTTL:   leaseTTL,
-		startTTL:   startTTL,
-		configTTL:  configTTL,
+		leaseTTL:   pttl(t, client, keys.Leases),
+		startTTL:   pttl(t, client, keys.LastStart),
+		configTTL:  pttl(t, client, keys.Config),
 	}
 }

@@ -339,7 +339,7 @@ func TestRedisStore_LongMinTimeSurvivesStateTTL(t *testing.T) {
 		t.Fatalf("first Request = (%v, %v), want (true, nil)", canRun, err)
 	}
 
-	ttl, err := client.PTTL(context.Background(), "gothrottle:"+id).Result()
+	ttl, err := client.PTTL(context.Background(), gothrottle.RedisStateKey(id)).Result()
 	if err != nil {
 		t.Fatalf("PTTL failed: %v", err)
 	}

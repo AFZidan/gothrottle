@@ -122,8 +122,12 @@ func (o Options) leaseTTL() time.Duration {
 // RetryInterval, MaxQueueSize, SchedPolicy, OnError — are deliberately absent:
 // they change how one process queues work, not what the store admits, so two
 // instances may legitimately differ on them.
+//
+// Every field is int64, matching what Redis returns. Narrowing maxConcurrent
+// back to int would be unsound on a 32-bit build, where a stored value above
+// 2^31-1 wraps — and this value comes from Redis, not from local Options.
 type leaseConfig struct {
-	maxConcurrent int
+	maxConcurrent int64
 	minTimeUS     int64
 	leaseTTLUS    int64
 }
@@ -132,7 +136,7 @@ type leaseConfig struct {
 // describe.
 func (o Options) leaseConfig() leaseConfig {
 	return leaseConfig{
-		maxConcurrent: o.MaxConcurrent,
+		maxConcurrent: int64(o.MaxConcurrent),
 		minTimeUS:     o.MinTime.Microseconds(),
 		leaseTTLUS:    o.leaseTTL().Microseconds(),
 	}

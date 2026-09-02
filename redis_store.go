@@ -83,7 +83,12 @@ func isNilClient(client redis.UniversalClient) bool {
 // This is the legacy counter path, kept for Datastore implementations and
 // callers that use Request/RegisterDone directly. It cannot tell a slow holder
 // from a dead one; the lease path is what the limiter uses.
-const redisScript = stateTTLHelper + `
+//
+// The TTL goes through redisEnsureTTLHelper because Request sizes it to cover
+// the spacing window while RegisterDone knows nothing about MinTime: a
+// completion that reset the TTL to its own default expired state that was still
+// protecting an active window, so a 40s MinTime lost its spacing after 30s.
+const redisScript = redisEnsureTTLHelper + `
 local key = KEYS[1]
 local max_concurrent = tonumber(ARGV[1])
 local min_time_us = tonumber(ARGV[2])
@@ -118,29 +123,9 @@ end
 
 redis.call("HINCRBY", key, "running", weight)
 redis.call("HSET", key, "last_start_us", now_us)
-ensure_state_ttl(key, ttl_ms)
+ensure_ttl(key, ttl_ms)
 
 return {1, 0}
-`
-
-// stateTTLHelper keeps the legacy state key's expiry monotonic. Request sizes
-// the TTL to cover the spacing window, and RegisterDone knows nothing about
-// MinTime, so a completion that reset the TTL to its own default expired state
-// that was still protecting an active window — a 40s MinTime lost its spacing
-// after 30s. Neither script may now shorten an existing expiry.
-const stateTTLHelper = `
-local function ensure_state_ttl(key, ttl_ms)
-    if ttl_ms <= 0 then
-        return
-    end
-    local current = redis.call("PTTL", key)
-    if current == -2 then
-        return
-    end
-    if current == -1 or current < ttl_ms then
-        redis.call("PEXPIRE", key, ttl_ms)
-    end
-end
 `
 
 // loadScript loads the Lua script into Redis and stores its SHA.
@@ -158,7 +143,6 @@ func (rs *RedisStore) loadScriptLocked() error {
 
 	sha := scriptSHA(redisScript)
 
-	// Check if script already exists
 	exists, err := rs.client.ScriptExists(rs.ctx, sha).Result()
 	if err != nil {
 		return err
@@ -169,7 +153,6 @@ func (rs *RedisStore) loadScriptLocked() error {
 		return nil
 	}
 
-	// Load the script
 	loadedSHA, err := rs.client.ScriptLoad(rs.ctx, redisScript).Result()
 	if err != nil {
 		return err
@@ -190,50 +173,46 @@ func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRu
 	if limiterID == "" {
 		return false, 0, ErrMissingID
 	}
-	if err := validateLimiterID(limiterID); err != nil {
+	if err := validateAdmission(limiterID, weight, opts); err != nil {
 		return false, 0, err
 	}
-	if weight <= 0 {
-		return false, 0, ErrInvalidWeight
-	}
-	if opts.MaxConcurrent > 0 && weight > opts.MaxConcurrent {
-		return false, 0, ErrWeightExceedsMax
-	}
 
-	args := []interface{}{
+	reply, err := rs.evalScript(limiterID, []interface{}{
 		opts.MaxConcurrent,
 		opts.MinTime.Microseconds(),
 		weight,
 		rs.stateTTL(opts).Milliseconds(),
-	}
-
-	result, err := rs.evalScript(limiterID, args)
+	})
 	if err != nil {
 		return false, 0, err
 	}
 
-	resultSlice, ok := result.([]interface{})
-	if !ok || len(resultSlice) != 2 {
+	return parseRequestReply(reply)
+}
+
+// parseRequestReply decodes the legacy admission script's reply: whether the job
+// may run, and for a spacing refusal how long remains of the window.
+func parseRequestReply(reply interface{}) (canRun bool, waitTime time.Duration, err error) {
+	values, ok := reply.([]interface{})
+	if !ok || len(values) != 2 {
 		return false, 0, fmt.Errorf("unexpected redis script result format")
 	}
 
-	canRunInt, ok := resultSlice[0].(int64)
-	if !ok {
-		return false, 0, fmt.Errorf("unexpected redis script result format for canRun")
+	admitted, err := toInt64(values[0])
+	if err != nil {
+		return false, 0, fmt.Errorf("unexpected redis script result for canRun: %w", err)
+	}
+	waitUS, err := toInt64(values[1])
+	if err != nil {
+		return false, 0, fmt.Errorf("unexpected redis script result for waitTime: %w", err)
 	}
 
-	waitTimeInt, ok := resultSlice[1].(int64)
-	if !ok {
-		return false, 0, fmt.Errorf("unexpected redis script result format for waitTime")
+	// A negative wait means the refusal has no deadline: capacity is held, and
+	// only another instance releasing it can change the outcome.
+	if waitUS > 0 {
+		waitTime = time.Duration(waitUS) * time.Microsecond
 	}
-
-	canRun = canRunInt == 1
-	waitTime = 0 // Default to no wait
-	if waitTimeInt > 0 {
-		waitTime = time.Duration(waitTimeInt) * time.Microsecond
-	}
-
-	return canRun, waitTime, nil
+	return admitted == 1, waitTime, nil
 }
 
 // evalScript runs the admission script, falling back to EVAL if Redis has
@@ -298,11 +277,8 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 	if limiterID == "" {
 		return ErrMissingID
 	}
-	if err := validateLimiterID(limiterID); err != nil {
+	if err := validateCompletion(limiterID, weight); err != nil {
 		return err
-	}
-	if weight <= 0 {
-		return ErrInvalidWeight
 	}
 
 	rs.mu.RLock()
@@ -367,14 +343,10 @@ func (rs *RedisStore) Close() error {
 
 // redisRegisterDoneScript records a completion on the legacy counter.
 //
-// It never shortens the key's expiry. Request sizes the TTL to outlast the
-// spacing window, and this script has no idea what MinTime is, so resetting the
-// TTL to its own fallback used to expire state that was still enforcing a
-// window: a 40s MinTime got an ~80s TTL on Request and a 30s TTL here, so
-// spacing silently stopped after 30s. The fallback now applies only when the key
-// has no usable expiry of its own, and last_start_us is left untouched either
-// way.
-const redisRegisterDoneScript = stateTTLHelper + `
+// The fallback TTL applies only when the key has no usable expiry of its own —
+// see redisEnsureTTLHelper for why. last_start_us is left untouched either way,
+// so spacing is measured from the job's start regardless of when it finished.
+const redisRegisterDoneScript = redisEnsureTTLHelper + `
 local key = KEYS[1]
 local weight = tonumber(ARGV[1])
 local ttl_ms = tonumber(ARGV[2])
@@ -384,7 +356,7 @@ if running < 0 then
     running = 0
 end
 redis.call("HSET", key, "running", running)
-ensure_state_ttl(key, ttl_ms)
+ensure_ttl(key, ttl_ms)
 return running
 `
 

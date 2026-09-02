@@ -473,28 +473,6 @@ func TestSpacing_LimiterEnforcesWindowAcrossJobCompletion(t *testing.T) {
 	})
 }
 
-// pttl reads a key's remaining TTL, failing the test if the key has none.
-func pttl(t *testing.T, client *redis.Client, key string) time.Duration {
-	t.Helper()
-
-	ttl, err := client.PTTL(context.Background(), key).Result()
-	if err != nil {
-		t.Fatalf("PTTL(%s) failed: %v", key, err)
-	}
-	// go-redis reports Redis's -2 (no such key) and -1 (no expiry) as those
-	// durations in nanoseconds.
-	switch ttl {
-	case -2:
-		t.Fatalf("key %s does not exist", key)
-	case -1:
-		t.Fatalf("key %s has no expiry", key)
-	}
-	if ttl <= 0 {
-		t.Fatalf("PTTL(%s) = %v, want a positive TTL", key, ttl)
-	}
-	return ttl
-}
-
 // seedExpiredLease writes a reservation that is already past its expiry, so the
 // next acquisition has to run its reclamation path. It returns the token.
 func seedExpiredLease(ctx context.Context, client *redis.Client, keys gothrottle.RedisKeyLayout) (string, error) {

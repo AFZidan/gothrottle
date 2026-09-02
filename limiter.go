@@ -74,7 +74,6 @@ type Limiter struct {
 
 // NewLimiter creates a new Limiter instance.
 func NewLimiter(opts Options) (*Limiter, error) {
-	// Validate options
 	if opts.Datastore != nil && opts.ID == "" {
 		return nil, ErrMissingID
 	}
@@ -109,7 +108,6 @@ func NewLimiter(opts Options) (*Limiter, error) {
 		limiter.leaseStore = leaseStore
 	}
 
-	// Start the scheduler
 	limiter.start()
 
 	return limiter, nil
@@ -163,26 +161,13 @@ func (l *Limiter) schedule(ctx context.Context, task func() (interface{}, error)
 		resultChan: make(chan interface{}, 1),
 		errorChan:  make(chan error, 1),
 	}
-
-	// Add job to queue
-	l.mu.Lock()
-	if !l.running {
-		l.mu.Unlock()
-		return nil, ErrStoreClosed
+	if err := l.enqueue(job); err != nil {
+		return nil, err
 	}
-	if l.opts.MaxQueueSize > 0 && l.queue.Len() >= l.opts.MaxQueueSize {
-		l.mu.Unlock()
-		return nil, ErrQueueFull
-	}
-	l.seq++
-	job.seq = l.seq
-	l.queue.PushJob(job)
-	l.mu.Unlock()
 
 	// Wake the scheduler so the job is considered immediately.
 	l.signal()
 
-	// Wait for job completion
 	select {
 	case result := <-job.resultChan:
 		return result, nil
@@ -191,6 +176,25 @@ func (l *Limiter) schedule(ctx context.Context, task func() (interface{}, error)
 	case <-ctx.Done():
 		return l.cancelQueued(job, ctx.Err())
 	}
+}
+
+// enqueue admits a job to the queue, assigning the sequence number that keeps
+// equal priorities in submission order. It reports why admission was refused:
+// the limiter has stopped, or the queue is at MaxQueueSize.
+func (l *Limiter) enqueue(job *Job) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if !l.running {
+		return ErrStoreClosed
+	}
+	if l.opts.MaxQueueSize > 0 && l.queue.Len() >= l.opts.MaxQueueSize {
+		return ErrQueueFull
+	}
+	l.seq++
+	job.seq = l.seq
+	l.queue.PushJob(job)
+	return nil
 }
 
 // cancelQueued handles a context that ended while the caller was waiting. A job
@@ -316,46 +320,71 @@ func (l *Limiter) Stop() error {
 func (l *Limiter) scheduler() {
 	defer l.wg.Done()
 
+	deadline := newDeadlineTimer()
+	defer deadline.stop()
+
+	for {
+		// A deadline is armed only when the queue is blocked on one: a MinTime
+		// window that has to elapse, or a distributed retry.
+		deadline.arm(l.dispatch())
+
+		select {
+		case <-l.stopCh:
+			l.processRemainingJobs()
+			return
+		case <-l.wake:
+		case <-deadline.fired():
+			deadline.disarmed()
+		}
+	}
+}
+
+// deadlineTimer is a reusable one-shot timer. It exists to keep the disarm dance
+// — stop, and drain the channel if the timer fired first — in one place instead
+// of at every point the scheduler might abandon a pending deadline.
+type deadlineTimer struct {
+	timer *time.Timer
+	armed bool
+}
+
+func newDeadlineTimer() *deadlineTimer {
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
 	}
-	timerArmed := false
+	return &deadlineTimer{timer: timer}
+}
 
-	for {
-		wait := l.dispatch()
+// arm replaces any pending deadline with a new one. A non-positive duration
+// leaves the timer disarmed, so the caller waits on events alone.
+func (d *deadlineTimer) arm(after time.Duration) {
+	d.stop()
+	if after > 0 {
+		d.timer.Reset(after)
+		d.armed = true
+	}
+}
 
-		// Arm the timer only when the queue is blocked on a deadline: a MinTime
-		// window that has to elapse, or a distributed retry.
-		if timerArmed && !timer.Stop() {
-			// Drain a timer that fired while we were dispatching.
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timerArmed = false
-		if wait > 0 {
-			timer.Reset(wait)
-			timerArmed = true
-		}
-
+// stop cancels a pending deadline, draining a firing that raced with the stop.
+func (d *deadlineTimer) stop() {
+	if d.armed && !d.timer.Stop() {
 		select {
-		case <-l.stopCh:
-			if timerArmed && !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			// Cancel anything still queued before stopping
-			l.processRemainingJobs()
-			return
-		case <-l.wake:
-		case <-timer.C:
-			timerArmed = false
+		case <-d.timer.C:
+		default:
 		}
 	}
+	d.armed = false
+}
+
+// fired is the channel a deadline arrives on.
+func (d *deadlineTimer) fired() <-chan time.Time {
+	return d.timer.C
+}
+
+// disarmed records that the deadline was consumed from fired(), so a later stop
+// does not try to drain an already-empty channel.
+func (d *deadlineTimer) disarmed() {
+	d.armed = false
 }
 
 // dispatch starts every queued job that can run right now. It returns how long
@@ -539,40 +568,42 @@ func (l *Limiter) executeJob(job *Job) {
 	// dead holder from a slow one. Renew for as long as the task runs so a job
 	// longer than the TTL keeps its capacity.
 	stopRenewal := l.startRenewal(job)
+	defer l.finishJob(job, stopRenewal)
 
-	defer func() {
-		if r := recover(); r != nil {
-			// Capture the stack here, while it is still the panicking
-			// goroutine's; by the time the caller sees the error it is gone.
-			l.failJob(job, &PanicError{Value: r, Stack: debug.Stack()})
-		}
-
-		stopRenewal()
-
-		l.mu.Lock()
-		l.localWeight -= job.Weight
-		if l.localWeight < 0 {
-			l.localWeight = 0
-		}
-		l.mu.Unlock()
-
-		l.releaseCapacity(job)
-		// Freed capacity may let queued work start immediately.
-		l.signal()
-	}()
-
-	// Execute the job
 	result, err := job.Task()
-
-	// Send result back
 	if err != nil {
 		l.failJob(job, err)
-	} else {
-		select {
-		case job.resultChan <- result:
-		default:
-		}
+		return
 	}
+	select {
+	case job.resultChan <- result:
+	default:
+	}
+}
+
+// finishJob releases everything a finished — or panicking — job holds: its
+// renewal goroutine, this limiter's share of the concurrency window, and the
+// datastore reservation. It runs deferred, so a panicking task takes the same
+// path as a returning one.
+func (l *Limiter) finishJob(job *Job, stopRenewal func()) {
+	if r := recover(); r != nil {
+		// Capture the stack here, while it is still the panicking goroutine's;
+		// by the time the caller sees the error it is gone.
+		l.failJob(job, &PanicError{Value: r, Stack: debug.Stack()})
+	}
+
+	stopRenewal()
+
+	l.mu.Lock()
+	l.localWeight -= job.Weight
+	if l.localWeight < 0 {
+		l.localWeight = 0
+	}
+	l.mu.Unlock()
+
+	l.releaseCapacity(job)
+	// Freed capacity may let queued work start immediately.
+	l.signal()
 }
 
 // startRenewal keeps a job's lease alive for as long as it runs and returns a
