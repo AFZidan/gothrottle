@@ -477,7 +477,7 @@ func storedLeaseConfig(values []interface{}) (leaseConfig, string, error) {
 	storedID, _ := values[4].(string)
 
 	return leaseConfig{
-		maxConcurrent: int(maxConcurrent),
+		maxConcurrent: maxConcurrent,
 		minTimeUS:     minTimeUS,
 		leaseTTLUS:    leaseTTLUS,
 	}, storedID, nil
