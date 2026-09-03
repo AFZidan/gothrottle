@@ -599,17 +599,22 @@ weight with `HMGET`. That gives three guarantees:
 - An expiry entry with no weight is removed, so it cannot accumulate.
 - A live lease is untouched: its weight still counts and it stays renewable.
 
-The work is deterministic and bounded:
+The summation and repair operations use bounded pagination:
 
-- The running weight is computed with read-only `ZRANGE` rank pages requesting at
-  most 256 live member names per summation page.
-- One `HMGET` is issued per `ZRANGE` rank page.
+- Exact summation page size is bounded to at most 256 expiry-ZSET members per `ZRANGE`
+  rank page.
+- `ZRANGE` produces at most 256 members by explicit rank range, which is passed directly
+  to `HMGET`.
 - Orphan cleanup passes use `ZSCAN` / `HSCAN` because duplicate elements in scan replies
   are harmless for idempotent `ZREM` and `HDEL` operations.
-- `COUNT` on `ZSCAN` / `HSCAN` is only a hint to Redis rather than a hard response bound,
-  as compactly encoded collections return all members in one response.
-- Deletion command arguments passed to `ZREM` and `HDEL` are re-chunked to <=256
-  arguments so `unpack()` never exceeds Lua's argument limits.
+- `COUNT 256` on `ZSCAN` / `HSCAN` is a work hint, not a strict response-size bound.
+  Depending on encoding and Redis implementation, a scan call may return more than the
+  requested count, including an entire compactly encoded collection (reply size is not
+  strictly bounded by 256).
+- Individual deletion command argument lists passed to `ZREM` and `HDEL` are explicitly
+  re-chunked to <=256 arguments so `unpack()` never exceeds Lua's argument limits.
+- Total reconciliation work scales with the number of lease/expiry records that must be
+  examined or repaired.
 - The healthy lease hash is not `HSCAN`ed: `HSCAN` runs only when the live entry count
   disagrees with `HLEN`, which is precisely when an orphan field exists in the hash.
 

@@ -74,24 +74,26 @@ end
 // of the hash, which is what makes the cardinality comparison exact — comparing
 // counts alone was the original defect, because a hash holding token A and a ZSET
 // holding token B both have one member and nothing was reconciled.
-//
 // Running weight is computed deterministically using read-only ZRANGE rank
-// pagination (at most reconcile_batch = 256 member names per ZRANGE call). This
-// avoids relying on ZSCAN, whose documented SCAN contract permits duplicate
+// pagination (at most reconcile_batch = 256 expiry-ZSET members per ZRANGE call).
+// This avoids relying on ZSCAN, whose documented SCAN contract permits duplicate
 // elements under dictionary rehash (which Redis 6.2+ and 7.x can trigger even
-// during read lookups).
+// during read lookups). ZRANGE produces at most 256 members by explicit rank range,
+// and that bounded page is passed directly to HMGET.
 //
 // The deletion repair passes (prune_weightless, prune_untracked_fields) may
 // continue using ZSCAN/HSCAN because duplicate returned elements are harmless for
 // idempotent ZREM and HDEL operations. Redis guarantees that an element present
-// throughout a full iteration is returned at least once.
+// throughout a full iteration is returned at least once. Individual deletion
+// buffers for ZREM and HDEL are explicitly re-chunked and flushed at at most
+// reconcile_batch (256) arguments so unpack() never exceeds Lua's argument limit.
 //
-// Note on SCAN memory and COUNT hints: COUNT 256 in ZSCAN/HSCAN is only a hint to
-// Redis, not a hard response bound. Compactly encoded hashes or sorted sets ignore
-// COUNT and return all elements in a single reply. Member lists passed to HMGET,
-// ZREM, and HDEL are explicitly re-chunked to at most reconcile_batch (256)
-// arguments so unpack() never exceeds Lua's stack limits regardless of collection
-// size or encoding.
+// Note on SCAN memory and COUNT hints: COUNT 256 in ZSCAN/HSCAN is a work hint, not
+// a strict response-size bound. Depending on encoding and Redis implementation, a
+// scan call may return more than the requested count, including an entire compactly
+// encoded collection. ZSCAN/HSCAN reply size is NOT strictly bounded by 256. Total
+// reconciliation work scales with the number of lease/expiry records that must be
+// examined or repaired.
 const redisReconcileHelper = `
 local reconcile_batch = 256
 
@@ -150,8 +152,8 @@ end
 
 -- prune_weightless drops expiry entries with no lease weight using ZSCAN.
 -- Duplicate returned elements are harmless because ZREM and HDEL are idempotent.
--- COUNT is a hint to Redis; compactly encoded collections may return all elements
--- in one scan reply.
+-- COUNT 256 is a work hint, not a strict response-size bound; a scan call may
+-- return more than requested, including an entire compactly encoded collection.
 local function prune_weightless(lease_key, exp_key)
     local zrem = new_deleter("ZREM", exp_key)
     local hdel = new_deleter("HDEL", lease_key)
@@ -175,8 +177,9 @@ local function prune_weightless(lease_key, exp_key)
 end
 
 -- prune_untracked_fields removes lease-hash fields with no expiry entry using HSCAN.
--- Duplicate returned fields are harmless because HDEL is idempotent. COUNT is a
--- hint; compactly encoded hashes may return all fields in a single reply.
+-- Duplicate returned fields are harmless because HDEL is idempotent. COUNT 256 is a
+-- work hint, not a strict response-size bound; a scan call may return more than
+-- requested, including an entire compactly encoded collection.
 local function prune_untracked_fields(lease_key, exp_key)
     local hdel = new_deleter("HDEL", lease_key)
     local cursor = "0"
