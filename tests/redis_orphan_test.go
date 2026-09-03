@@ -525,7 +525,7 @@ func TestRedisOrphan_CapacityBecomesAvailableAfterCleanup(t *testing.T) {
 func TestRedisOrphan_HealthyStateNeedsNoHashScan(t *testing.T) {
 	f := newOrphanFixture(t, "orphan-no-scan", gothrottle.Options{MaxConcurrent: 4, LeaseTTL: 30 * time.Second})
 
-	before := hkeysCalls(t, f.client)
+	before := hscanCalls(t, f.client)
 
 	var leases []*gothrottle.Lease
 	for i := 0; i < 4; i++ {
@@ -541,26 +541,109 @@ func TestRedisOrphan_HealthyStateNeedsNoHashScan(t *testing.T) {
 		}
 	}
 
-	if after := hkeysCalls(t, f.client); after != before {
-		t.Fatalf("HKEYS calls went from %d to %d; a healthy limiter must not scan the lease hash", before, after)
+	if after := hscanCalls(t, f.client); after != before {
+		t.Fatalf("HSCAN calls went from %d to %d; a healthy limiter must not scan the lease hash", before, after)
 	}
 }
 
-// hkeysCalls reads how many HKEYS commands this Redis has served. HKEYS is the
-// membership walk reconciliation needs and nothing else in the package uses, so
-// its count is a direct measure of whether the repair path ran.
-//
-// Redis is shared between tests, so the value is only meaningful as a difference
-// measured across an interval.
-func hkeysCalls(t *testing.T, client *redis.Client) int64 {
+// TestRedisOrphan_ExactSummationStrategyPagination verifies that running-weight
+// summation uses deterministic ZRANGE rank pagination across multiple pages
+// (256 members per page) without invoking ZSCAN or HSCAN on healthy state.
+func TestRedisOrphan_ExactSummationStrategyPagination(t *testing.T) {
+	f := newOrphanFixture(t, "orphan-zrange-pagination", gothrottle.Options{MaxConcurrent: 1000, LeaseTTL: 30 * time.Second})
+
+	// Seed 300 valid matching lease hash and expiration ZSET records.
+	const count = 300
+	future := f.futureScore(t)
+
+	pipe := f.client.Pipeline()
+	for i := 0; i < count; i++ {
+		token := fmt.Sprintf("token-%03d", i)
+		pipe.HSet(f.ctx, f.keys.Leases, token, 1)
+		pipe.ZAdd(f.ctx, f.keys.Expirations, &redis.Z{Score: future, Member: token})
+	}
+	if _, err := pipe.Exec(f.ctx); err != nil {
+		t.Fatalf("seeding matching leases failed: %v", err)
+	}
+
+	if f.hlen(t) != count || f.zcard(t) != count {
+		t.Fatalf("seeding failed: HLEN=%d ZCARD=%d, want %d", f.hlen(t), f.zcard(t), count)
+	}
+
+	zrangeBefore := zrangeCalls(t, f.client)
+	zscanBefore := zscanCalls(t, f.client)
+	hscanBefore := hscanCalls(t, f.client)
+
+	// Acquire 1 unit of capacity. With 300 existing valid leases (weight 1 each),
+	// running weight is 300.
+	lease, _, err := f.store.Acquire(f.ctx, f.id, 1, f.opts)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("Acquire was refused even though capacity (300/1000) was available")
+	}
+
+	zrangeDelta := zrangeCalls(t, f.client) - zrangeBefore
+	zscanDelta := zscanCalls(t, f.client) - zscanBefore
+	hscanDelta := hscanCalls(t, f.client) - hscanBefore
+
+	// 300 elements at 256 per page require ceil(300/256) = 2 ZRANGE rank pages.
+	if zrangeDelta != 2 {
+		t.Fatalf("ZRANGE call delta = %d, want 2 (for 300 members with page size 256)", zrangeDelta)
+	}
+	if zscanDelta != 0 {
+		t.Fatalf("ZSCAN call delta = %d, want 0 (running weight must use ZRANGE rank pagination)", zscanDelta)
+	}
+	if hscanDelta != 0 {
+		t.Fatalf("HSCAN call delta = %d, want 0 (healthy matching state must not scan lease hash)", hscanDelta)
+	}
+
+	// Verify numeric capacity decision exactness.
+	// Current running weight is now 301 (300 seeded + 1 acquired). Limit is 1000.
+	// Weight 700 would put total at 1001 (> 1000) -> refused.
+	overLease, _, err := f.store.Acquire(f.ctx, f.id, 700, f.opts)
+	if err != nil {
+		t.Fatalf("Acquire over limit failed: %v", err)
+	}
+	if overLease != nil {
+		t.Fatal("Acquire weight 700 succeeded, want refusal (301 + 700 > 1000)")
+	}
+
+	// Weight 699 puts total at 1000 (<= 1000) -> admitted.
+	exactLease, _, err := f.store.Acquire(f.ctx, f.id, 699, f.opts)
+	if err != nil {
+		t.Fatalf("Acquire exact limit failed: %v", err)
+	}
+	if exactLease == nil {
+		t.Fatal("Acquire weight 699 refused, want admission (301 + 699 == 1000)")
+	}
+
+	_ = f.store.Release(f.ctx, lease)
+	_ = f.store.Release(f.ctx, exactLease)
+}
+
+func hscanCalls(t *testing.T, client *redis.Client) int64 {
+	return commandCalls(t, client, "hscan")
+}
+
+func zrangeCalls(t *testing.T, client *redis.Client) int64 {
+	return commandCalls(t, client, "zrange")
+}
+
+func zscanCalls(t *testing.T, client *redis.Client) int64 {
+	return commandCalls(t, client, "zscan")
+}
+
+func commandCalls(t *testing.T, client *redis.Client, command string) int64 {
 	t.Helper()
 
 	stats, err := client.Info(context.Background(), "commandstats").Result()
 	if err != nil {
 		t.Fatalf("INFO commandstats failed: %v", err)
 	}
+	prefix := fmt.Sprintf("cmdstat_%s:calls=", command)
 	for _, line := range splitLines(stats) {
-		const prefix = "cmdstat_hkeys:calls="
 		if !hasPrefix(line, prefix) {
 			continue
 		}
@@ -574,7 +657,6 @@ func hkeysCalls(t *testing.T, client *redis.Client) int64 {
 		}
 		return calls
 	}
-	// HKEYS has never been called on this server.
 	return 0
 }
 

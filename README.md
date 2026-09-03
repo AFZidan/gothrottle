@@ -60,13 +60,13 @@
   misses equal-cardinality corruption: a lease hash holding token A and an expiry
   ZSET holding token B are both size 1, so nothing was repaired and token A
   consumed capacity forever with no expiry entry that could ever release it. The
-  running weight is now summed by walking the expiry ZSET and reading each token's
-  weight, so a weight with no expiry entry is never counted, and expiry entries
-  with no weight are removed. Both collections are walked and deleted in batches,
-  so no `unpack()` can approach Lua's argument limit however much corruption has
-  accumulated. `last-start`, live leases and the configuration record are not
-  touched. See "Orphan reconciliation" in the README for what is and is not
-  guaranteed for an unlimited limiter.
+  running weight is now summed by deterministic read-only `ZRANGE` rank pagination
+  over the expiry ZSET and reading each token's weight with `HMGET` (at most 256
+  member names per rank page), avoiding `ZSCAN` duplicate count inflation. A weight
+  with no expiry entry is never counted, and expiry entries with no weight are
+  removed via `ZSCAN`/`HSCAN` (where duplicate scan returns are harmless for
+  idempotent deletions). `last-start`, live leases and the configuration record are
+  not touched. See "Orphan reconciliation" in the README for exact guarantees.
 - **The legacy Redis spacing path clamps a backwards clock**. The lease script
   already capped a computed wait at `MinTime`; `Request` did not, so a Redis
   server whose clock stepped backwards reported a wait far longer than the window
@@ -592,19 +592,26 @@ path can never reclaim would hold capacity until someone noticed by hand.
 
 For a limiter with a positive `MaxConcurrent`, every acquisition reconciles by
 membership. The expiry ZSET is authoritative for liveness, so the running weight
-is summed by walking it and reading each token's weight. That gives three
-guarantees:
+is summed by walking it with read-only `ZRANGE` rank pages and reading each token's
+weight with `HMGET`. That gives three guarantees:
 
 - A weight in the hash with no expiry entry is never counted, and is removed.
 - An expiry entry with no weight is removed, so it cannot accumulate.
 - A live lease is untouched: its weight still counts and it stays renewable.
 
-The work is bounded. Members are read and deleted in batches, so no `unpack()`
-approaches Lua's argument limit however much corruption has accumulated. The cost
-is one `ZRANGE` plus one `HMGET` per 256 live leases — and live leases are bounded
-by `MaxConcurrent`, since each weighs at least 1. The lease hash is only scanned
-(`HKEYS`) when the counts still disagree after that, which is exactly when it
-holds an orphan; a healthy limiter never scans it.
+The work is deterministic and bounded:
+
+- The running weight is computed with read-only `ZRANGE` rank pages requesting at
+  most 256 live member names per summation page.
+- One `HMGET` is issued per `ZRANGE` rank page.
+- Orphan cleanup passes use `ZSCAN` / `HSCAN` because duplicate elements in scan replies
+  are harmless for idempotent `ZREM` and `HDEL` operations.
+- `COUNT` on `ZSCAN` / `HSCAN` is only a hint to Redis rather than a hard response bound,
+  as compactly encoded collections return all members in one response.
+- Deletion command arguments passed to `ZREM` and `HDEL` are re-chunked to <=256
+  arguments so `unpack()` never exceeds Lua's argument limits.
+- The healthy lease hash is not `HSCAN`ed: `HSCAN` runs only when the live entry count
+  disagrees with `HLEN`, which is precisely when an orphan field exists in the hash.
 
 With `MaxConcurrent` at 0 the guarantee is narrower, deliberately. There is no
 limit for an orphan to consume, so orphan state costs memory rather than

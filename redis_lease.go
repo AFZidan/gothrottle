@@ -75,28 +75,23 @@ end
 // counts alone was the original defect, because a hash holding token A and a ZSET
 // holding token B both have one member and nothing was reconciled.
 //
-// Nothing here materializes a whole collection. Iteration is by ZSCAN and HSCAN
-// cursor, and every command that takes a member list is capped at
-// reconcile_batch arguments. Two properties of running inside Lua make cursors
-// safe to reason about:
+// Running weight is computed deterministically using read-only ZRANGE rank
+// pagination (at most reconcile_batch = 256 member names per ZRANGE call). This
+// avoids relying on ZSCAN, whose documented SCAN contract permits duplicate
+// elements under dictionary rehash (which Redis 6.2+ and 7.x can trigger even
+// during read lookups).
 //
-//   - The script is atomic, so the only writes during an iteration are its own.
-//     A cursor scan with no writes therefore returns each member exactly once —
-//     the duplicate case in Redis's SCAN contract requires a rehash, and a rehash
-//     requires a write. That is why the weight sum is a strictly read-only pass:
-//     a duplicate there would double-count and inflate the running weight.
-//   - The passes that delete tolerate duplicates, because the action is an
-//     idempotent removal. SCAN still guarantees that a member present throughout
-//     is returned at least once, so nothing that should be deleted is skipped,
-//     and nothing that should survive can be missed by a later pass.
+// The deletion repair passes (prune_weightless, prune_untracked_fields) may
+// continue using ZSCAN/HSCAN because duplicate returned elements are harmless for
+// idempotent ZREM and HDEL operations. Redis guarantees that an element present
+// throughout a full iteration is returned at least once.
 //
-// One caveat, stated because it is a real bound rather than an absolute one: for a
-// small collection Redis uses a listpack encoding and SCAN ignores COUNT,
-// returning the whole thing in one reply. That reply is bounded by
-// hash-max-listpack-entries / zset-max-listpack-entries (128 by default), so it is
-// bounded by configuration rather than by this script. Member lists passed to
-// HMGET, ZREM and HDEL are re-chunked to reconcile_batch regardless, so no
-// unpack() ever exceeds it.
+// Note on SCAN memory and COUNT hints: COUNT 256 in ZSCAN/HSCAN is only a hint to
+// Redis, not a hard response bound. Compactly encoded hashes or sorted sets ignore
+// COUNT and return all elements in a single reply. Member lists passed to HMGET,
+// ZREM, and HDEL are explicitly re-chunked to at most reconcile_batch (256)
+// arguments so unpack() never exceeds Lua's stack limits regardless of collection
+// size or encoding.
 const redisReconcileHelper = `
 local reconcile_batch = 256
 
@@ -122,61 +117,41 @@ local function deleter_add(d, member)
     end
 end
 
--- scan_members pulls the member names out of a SCAN reply's flat member/value
--- list.
-local function scan_members(flat)
-    local members = {}
-    for i = 1, #flat, 2 do
-        members[#members + 1] = flat[i]
-    end
-    return members
-end
-
 -- sum_live_weight totals the weight of every token that has one, and counts the
--- tokens with and without. It writes nothing: exactness depends on the scan seeing
--- an unchanging collection, and a duplicate member would inflate the total.
+-- tokens with and without. It writes nothing: exactness depends on deterministic,
+-- read-only ZRANGE rank pagination over the expiry ZSET (at most reconcile_batch
+-- members per rank page), fetching weights via one HMGET per page.
 local function sum_live_weight(lease_key, exp_key)
     local running, live, weightless = 0, 0, 0
-    local cursor = "0"
+    local start = 0
 
     repeat
-        local reply = redis.call("ZSCAN", exp_key, cursor, "COUNT", reconcile_batch)
-        cursor = reply[1]
-        local members = scan_members(reply[2])
-
-        -- Re-chunked rather than passed straight through: a listpack-encoded ZSET
-        -- ignores COUNT and hands back everything at once.
-        local i = 1
-        while i <= #members do
-            local last = i + reconcile_batch - 1
-            if last > #members then
-                last = #members
-            end
-            local chunk = {}
-            for j = i, last do
-                chunk[#chunk + 1] = members[j]
-            end
-            local weights = redis.call("HMGET", lease_key, unpack(chunk))
-            for j = 1, #chunk do
-                local weight = tonumber(weights[j])
-                if weight and weight > 0 then
-                    running = running + weight
-                    live = live + 1
-                else
-                    weightless = weightless + 1
-                end
-            end
-            i = last + 1
+        local members = redis.call("ZRANGE", exp_key, start, start + reconcile_batch - 1)
+        if #members == 0 then
+            break
         end
-    until cursor == "0"
+
+        local weights = redis.call("HMGET", lease_key, unpack(members))
+        for j = 1, #members do
+            local weight = tonumber(weights[j])
+            if weight and weight > 0 then
+                running = running + weight
+                live = live + 1
+            else
+                weightless = weightless + 1
+            end
+        end
+
+        start = start + #members
+    until #members < reconcile_batch
 
     return running, live, weightless
 end
 
--- prune_weightless drops expiry entries with no lease weight. Neither record can
--- describe a live reservation, so both go: left in place the entry would
--- accumulate, and the surviving mismatch would make every later acquisition scan
--- the hash.
+-- prune_weightless drops expiry entries with no lease weight using ZSCAN.
+-- Duplicate returned elements are harmless because ZREM and HDEL are idempotent.
+-- COUNT is a hint to Redis; compactly encoded collections may return all elements
+-- in one scan reply.
 local function prune_weightless(lease_key, exp_key)
     local zrem = new_deleter("ZREM", exp_key)
     local hdel = new_deleter("HDEL", lease_key)
@@ -199,14 +174,9 @@ local function prune_weightless(lease_key, exp_key)
     deleter_flush(hdel)
 end
 
--- prune_untracked_fields removes lease-hash fields with no expiry entry. Those
--- hold capacity nothing can ever reclaim, since only an expiry entry is ever
--- expired.
---
--- Each candidate is checked with its own ZSCORE rather than against a membership
--- set, because a set covering the whole ZSET is exactly the unbounded allocation
--- being avoided. That is one extra command per hash field, paid only when the
--- counts disagree — which is when the hash genuinely holds an orphan.
+-- prune_untracked_fields removes lease-hash fields with no expiry entry using HSCAN.
+-- Duplicate returned fields are harmless because HDEL is idempotent. COUNT is a
+-- hint; compactly encoded hashes may return all fields in a single reply.
 local function prune_untracked_fields(lease_key, exp_key)
     local hdel = new_deleter("HDEL", lease_key)
     local cursor = "0"
