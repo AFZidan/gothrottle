@@ -50,6 +50,14 @@ var (
 	// ErrInvalidSchedPolicy is returned when SchedPolicy is not a known policy.
 	ErrInvalidSchedPolicy = errors.New("SchedPolicy is not a known scheduling policy")
 
+	// ErrValueOutOfRange is returned when a configuration value or job weight is
+	// too large to be enforced exactly. Redis decides admission inside Lua, whose
+	// numbers are IEEE-754 doubles, so an integer above 2^53-1 would be compared
+	// as a rounded approximation: two different limits could look equal, and a
+	// limit could be silently shifted. Errors wrapping it name the field and the
+	// supported maximum.
+	ErrValueOutOfRange = errors.New("value exceeds the range that can be enforced exactly")
+
 	// ErrNilClient is returned when a Redis store is constructed without a
 	// client. It unwraps to ErrStoreClosed, both because a store with no client
 	// can never serve a request and so that code written against the previous

@@ -64,6 +64,190 @@ local function ensure_ttl(key, ttl_ms)
 end
 `
 
+// redisReconcileHelper computes a limiter's running weight and, on the way,
+// repairs reservation records that the normal expiry path can never reclaim.
+//
+// The expiry ZSET is authoritative for liveness, so the sum walks it rather than
+// the lease hash. That inverts the older failure: a weight in the hash with no
+// expiry entry is simply never counted, instead of consuming capacity forever.
+// Removing the expiry entries that have no weight then leaves the ZSET a subset
+// of the hash, which is what makes the cardinality comparison exact — comparing
+// counts alone was the original defect, because a hash holding token A and a ZSET
+// holding token B both have one member and nothing was reconciled.
+//
+// Nothing here materializes a whole collection. Iteration is by ZSCAN and HSCAN
+// cursor, and every command that takes a member list is capped at
+// reconcile_batch arguments. Two properties of running inside Lua make cursors
+// safe to reason about:
+//
+//   - The script is atomic, so the only writes during an iteration are its own.
+//     A cursor scan with no writes therefore returns each member exactly once —
+//     the duplicate case in Redis's SCAN contract requires a rehash, and a rehash
+//     requires a write. That is why the weight sum is a strictly read-only pass:
+//     a duplicate there would double-count and inflate the running weight.
+//   - The passes that delete tolerate duplicates, because the action is an
+//     idempotent removal. SCAN still guarantees that a member present throughout
+//     is returned at least once, so nothing that should be deleted is skipped,
+//     and nothing that should survive can be missed by a later pass.
+//
+// One caveat, stated because it is a real bound rather than an absolute one: for a
+// small collection Redis uses a listpack encoding and SCAN ignores COUNT,
+// returning the whole thing in one reply. That reply is bounded by
+// hash-max-listpack-entries / zset-max-listpack-entries (128 by default), so it is
+// bounded by configuration rather than by this script. Member lists passed to
+// HMGET, ZREM and HDEL are re-chunked to reconcile_batch regardless, so no
+// unpack() ever exceeds it.
+const redisReconcileHelper = `
+local reconcile_batch = 256
+
+-- deleter accumulates members and flushes in bounded batches, so unpack() never
+-- receives more than reconcile_batch arguments however much state is being
+-- repaired.
+local function new_deleter(cmd, key)
+    return {cmd = cmd, key = key, buf = {}}
+end
+
+local function deleter_flush(d)
+    if #d.buf == 0 then
+        return
+    end
+    redis.call(d.cmd, d.key, unpack(d.buf))
+    d.buf = {}
+end
+
+local function deleter_add(d, member)
+    d.buf[#d.buf + 1] = member
+    if #d.buf >= reconcile_batch then
+        deleter_flush(d)
+    end
+end
+
+-- scan_members pulls the member names out of a SCAN reply's flat member/value
+-- list.
+local function scan_members(flat)
+    local members = {}
+    for i = 1, #flat, 2 do
+        members[#members + 1] = flat[i]
+    end
+    return members
+end
+
+-- sum_live_weight totals the weight of every token that has one, and counts the
+-- tokens with and without. It writes nothing: exactness depends on the scan seeing
+-- an unchanging collection, and a duplicate member would inflate the total.
+local function sum_live_weight(lease_key, exp_key)
+    local running, live, weightless = 0, 0, 0
+    local cursor = "0"
+
+    repeat
+        local reply = redis.call("ZSCAN", exp_key, cursor, "COUNT", reconcile_batch)
+        cursor = reply[1]
+        local members = scan_members(reply[2])
+
+        -- Re-chunked rather than passed straight through: a listpack-encoded ZSET
+        -- ignores COUNT and hands back everything at once.
+        local i = 1
+        while i <= #members do
+            local last = i + reconcile_batch - 1
+            if last > #members then
+                last = #members
+            end
+            local chunk = {}
+            for j = i, last do
+                chunk[#chunk + 1] = members[j]
+            end
+            local weights = redis.call("HMGET", lease_key, unpack(chunk))
+            for j = 1, #chunk do
+                local weight = tonumber(weights[j])
+                if weight and weight > 0 then
+                    running = running + weight
+                    live = live + 1
+                else
+                    weightless = weightless + 1
+                end
+            end
+            i = last + 1
+        end
+    until cursor == "0"
+
+    return running, live, weightless
+end
+
+-- prune_weightless drops expiry entries with no lease weight. Neither record can
+-- describe a live reservation, so both go: left in place the entry would
+-- accumulate, and the surviving mismatch would make every later acquisition scan
+-- the hash.
+local function prune_weightless(lease_key, exp_key)
+    local zrem = new_deleter("ZREM", exp_key)
+    local hdel = new_deleter("HDEL", lease_key)
+    local cursor = "0"
+
+    repeat
+        local reply = redis.call("ZSCAN", exp_key, cursor, "COUNT", reconcile_batch)
+        cursor = reply[1]
+        local flat = reply[2]
+        for i = 1, #flat, 2 do
+            local weight = tonumber(redis.call("HGET", lease_key, flat[i]))
+            if not weight or weight <= 0 then
+                deleter_add(zrem, flat[i])
+                deleter_add(hdel, flat[i])
+            end
+        end
+    until cursor == "0"
+
+    deleter_flush(zrem)
+    deleter_flush(hdel)
+end
+
+-- prune_untracked_fields removes lease-hash fields with no expiry entry. Those
+-- hold capacity nothing can ever reclaim, since only an expiry entry is ever
+-- expired.
+--
+-- Each candidate is checked with its own ZSCORE rather than against a membership
+-- set, because a set covering the whole ZSET is exactly the unbounded allocation
+-- being avoided. That is one extra command per hash field, paid only when the
+-- counts disagree — which is when the hash genuinely holds an orphan.
+local function prune_untracked_fields(lease_key, exp_key)
+    local hdel = new_deleter("HDEL", lease_key)
+    local cursor = "0"
+
+    repeat
+        local reply = redis.call("HSCAN", lease_key, cursor, "COUNT", reconcile_batch)
+        cursor = reply[1]
+        local flat = reply[2]
+        for i = 1, #flat, 2 do
+            if not redis.call("ZSCORE", exp_key, flat[i]) then
+                deleter_add(hdel, flat[i])
+            end
+        end
+    until cursor == "0"
+
+    deleter_flush(hdel)
+end
+
+-- running_weight is the limiter's committed weight, repairing orphaned records on
+-- the way. The sum is taken before any repair, and repairs only remove records
+-- that contributed nothing to it, so the value stays exact.
+local function running_weight(lease_key, exp_key)
+    local running, live, weightless = sum_live_weight(lease_key, exp_key)
+
+    if weightless > 0 then
+        prune_weightless(lease_key, exp_key)
+    end
+
+    -- Every surviving expiry entry has a weight, so the ZSET is a subset of the
+    -- hash and a count mismatch means the hash holds fields the ZSET does not.
+    -- Comparing against the counted live entries is exact, which HLEN vs ZCARD
+    -- was not: there, a hash holding token A and a ZSET holding token B both
+    -- counted one and nothing was repaired.
+    if redis.call("HLEN", lease_key) ~= live then
+        prune_untracked_fields(lease_key, exp_key)
+    end
+
+    return running
+end
+`
+
 // redisAcquireScript checks configuration agreement, reclaims expired leases,
 // then admits or refuses the request.
 //
@@ -77,7 +261,7 @@ end
 //	{0, 0, -1}                                    refused, capacity held
 //	{0, 0, wait_us}                               refused, retry after wait_us
 //	{-1, max, min_time_us, lease_ttl_us, id}      configuration mismatch
-const redisAcquireScript = redisEnsureTTLHelper + `
+const redisAcquireScript = redisEnsureTTLHelper + redisReconcileHelper + `
 local lease_key = KEYS[1]
 local exp_key = KEYS[2]
 local start_key = KEYS[3]
@@ -136,37 +320,25 @@ while true do
 end
 
 -- Running weight is summed from the live leases, so it cannot drift out of step
--- with the reservations it represents. The reclaim loop above has just removed
--- everything lapsed, and the hash and the expiry set are always written
--- together, so the hash holds exactly the live leases — bounded by
--- max_concurrent, since each weighs at least 1.
+-- with the reservations it represents. See redisReconcileHelper for how orphaned
+-- records are reconciled while summing.
 --
--- The length comparison reconciles state this package did not write: after a
--- partial restore or manual surgery, a hash field could outlive its expiry entry
--- and hold capacity forever. It costs one comparison when nothing is wrong.
+-- The comparison is subtraction rather than "running + weight > max_concurrent",
+-- matching the Go side: both operands are individually within Lua's exact range,
+-- but their sum need not be, and a sum that rounds turns a refusal into an
+-- admission. max_concurrent - running is bounded by max_concurrent, so it stays
+-- exact.
 if max_concurrent > 0 then
-    if redis.call("HLEN", lease_key) ~= redis.call("ZCARD", exp_key) then
-        local tracked = {}
-        local live = redis.call("ZRANGE", exp_key, 0, -1)
-        for i = 1, #live do
-            tracked[live[i]] = true
-        end
-        local fields = redis.call("HKEYS", lease_key)
-        for i = 1, #fields do
-            if not tracked[fields[i]] then
-                redis.call("HDEL", lease_key, fields[i])
-            end
-        end
-    end
-
-    local running = 0
-    local held = redis.call("HGETALL", lease_key)
-    for i = 2, #held, 2 do
-        running = running + tonumber(held[i])
-    end
-    if running + weight > max_concurrent then
+    local running = running_weight(lease_key, exp_key)
+    if running >= max_concurrent or weight > max_concurrent - running then
         return {0, 0, -1}
     end
+elseif redis.call("HLEN", lease_key) ~= redis.call("ZCARD", exp_key) then
+    -- With no concurrency limit there is no capacity for an orphan to hold, so
+    -- one costs memory rather than correctness. Reconcile only when the counts
+    -- disagree: an unlimited limiter must not pay for a membership walk on every
+    -- admission.
+    running_weight(lease_key, exp_key)
 end
 
 if min_time_us > 0 then
@@ -390,15 +562,31 @@ func (rs *RedisStore) Acquire(ctx context.Context, limiterID string, weight int,
 
 	ttl := opts.leaseTTL()
 	config := opts.leaseConfig()
+
+	// The three key TTLs are derived here rather than supplied, so validation has
+	// not seen them. Each is bounded in its own right before it reaches Lua.
+	leaseTTLMS, err := luaMillis("lease key TTL in milliseconds", leaseStateWindow(ttl))
+	if err != nil {
+		return nil, 0, err
+	}
+	startTTLMS, err := luaMillis("spacing key TTL in milliseconds", spacingStateWindow(opts.MinTime))
+	if err != nil {
+		return nil, 0, err
+	}
+	configTTLMS, err := luaMillis("config key TTL in milliseconds", configLifetime(ttl, opts.MinTime))
+	if err != nil {
+		return nil, 0, err
+	}
+
 	reply, err := rs.evalLeaseScript(ctx, redisAcquireScript, acquireScriptSHA, newLimiterKeys(limiterID).admission(), []interface{}{
 		config.maxConcurrent,
 		config.minTimeUS,
 		weight,
 		token,
 		config.leaseTTLUS,
-		leaseStateWindow(ttl).Milliseconds(),
-		spacingStateWindow(opts.MinTime).Milliseconds(),
-		configLifetime(ttl, opts.MinTime).Milliseconds(),
+		leaseTTLMS,
+		startTTLMS,
+		configTTLMS,
 		limiterID,
 	})
 	if err != nil {
@@ -434,11 +622,9 @@ func parseAcquireReply(reply interface{}, limiterID string, weight int, token st
 		if err != nil {
 			return nil, 0, fmt.Errorf("unexpected redis acquire result: %w", err)
 		}
-		var retryAfter time.Duration
-		if waitUS > 0 {
-			retryAfter = time.Duration(waitUS) * time.Microsecond
-		}
-		return nil, retryAfter, nil
+		// Clamped on conversion: a nonsense reply must not wrap into a negative
+		// Duration, which the scheduler reads as "no deadline" and stops waiting on.
+		return nil, microsToDuration(waitUS), nil
 	}
 
 	expiresUS, err := toInt64(values[1])
@@ -451,7 +637,7 @@ func parseAcquireReply(reply interface{}, limiterID string, weight int, token st
 		LimiterID: limiterID,
 		Weight:    weight,
 		TTL:       ttl,
-		ExpiresAt: time.Unix(0, expiresUS*int64(time.Microsecond)),
+		ExpiresAt: microsToTime(expiresUS),
 	}, 0, nil
 }
 
@@ -484,6 +670,10 @@ func storedLeaseConfig(values []interface{}) (leaseConfig, string, error) {
 }
 
 // Renew extends a lease. It implements LeaseDatastore.
+//
+// The lease is caller-supplied and no validator has seen it — a Lease can be
+// constructed literally, or restored from storage — so the TTL derived from it is
+// bounded here before it reaches Lua.
 func (rs *RedisStore) Renew(ctx context.Context, lease *Lease) error {
 	if lease == nil {
 		return ErrNilLease
@@ -495,11 +685,19 @@ func (rs *RedisStore) Renew(ctx context.Context, lease *Lease) error {
 	// Reuse the TTL the lease was created with: renewal extends the window, it
 	// does not redefine it.
 	ttl := lease.ttlOrDefault()
+	ttlUS, err := luaMicros("Lease.TTL in microseconds", ttl)
+	if err != nil {
+		return err
+	}
+	stateTTLMS, err := luaMillis("lease key TTL in milliseconds", leaseStateWindow(ttl))
+	if err != nil {
+		return err
+	}
 
 	reply, err := rs.evalLeaseScript(ctx, redisRenewScript, renewScriptSHA, newLimiterKeys(lease.LimiterID).reservation(), []interface{}{
 		lease.Token,
-		ttl.Microseconds(),
-		leaseStateWindow(ttl).Milliseconds(),
+		ttlUS,
+		stateTTLMS,
 	})
 	if err != nil {
 		return err
@@ -513,11 +711,14 @@ func (rs *RedisStore) Renew(ctx context.Context, lease *Lease) error {
 		return ErrLeaseLost
 	}
 
-	lease.ExpiresAt = time.Unix(0, expiresUS*int64(time.Microsecond))
+	lease.ExpiresAt = microsToTime(expiresUS)
 	return nil
 }
 
 // Release returns a lease's capacity. It implements LeaseDatastore.
+//
+// Like Renew, the lease is caller-supplied, so its derived TTL is bounded before
+// it reaches Lua.
 func (rs *RedisStore) Release(ctx context.Context, lease *Lease) error {
 	if lease == nil {
 		return ErrNilLease
@@ -529,10 +730,14 @@ func (rs *RedisStore) Release(ctx context.Context, lease *Lease) error {
 	// A release of an already-reclaimed lease is not an error: the store has
 	// moved on, and only this token is touched, so a newer holder's reservation
 	// is untouched either way.
-	ttl := lease.ttlOrDefault()
-	_, err := rs.evalLeaseScript(ctx, redisReleaseScript, releaseScriptSHA, newLimiterKeys(lease.LimiterID).reservation(), []interface{}{
+	stateTTLMS, err := luaMillis("lease key TTL in milliseconds", leaseStateWindow(lease.ttlOrDefault()))
+	if err != nil {
+		return err
+	}
+
+	_, err = rs.evalLeaseScript(ctx, redisReleaseScript, releaseScriptSHA, newLimiterKeys(lease.LimiterID).reservation(), []interface{}{
 		lease.Token,
-		leaseStateWindow(ttl).Milliseconds(),
+		stateTTLMS,
 	})
 	return err
 }

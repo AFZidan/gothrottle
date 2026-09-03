@@ -110,14 +110,25 @@ for i = 1, #state, 2 do
     end
 end
 
-if max_concurrent > 0 and running + weight > max_concurrent then
+-- Subtraction rather than "running + weight > max_concurrent": both operands are
+-- individually within Lua's exact range, but their sum need not be, and a sum that
+-- rounds turns a refusal into an admission. max_concurrent - running is bounded by
+-- max_concurrent, so it stays exact. Matches the lease script and the Go side.
+if max_concurrent > 0 and (running >= max_concurrent or weight > max_concurrent - running) then
     return {0, -1}
 end
 
 if min_time_us > 0 and last_start > 0 then
     local elapsed = now_us - last_start
     if elapsed < min_time_us then
-        return {0, min_time_us - elapsed}
+        local wait_us = min_time_us - elapsed
+        -- A Redis clock that moved backwards would otherwise report a wait
+        -- longer than the window itself, stalling the caller past the spacing it
+        -- actually owes. The lease script clamps the same way.
+        if wait_us > min_time_us then
+            wait_us = min_time_us
+        end
+        return {0, wait_us}
     end
 end
 
@@ -177,11 +188,18 @@ func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRu
 		return false, 0, err
 	}
 
+	// Validation has already bounded MaxConcurrent, weight and MinTime, but the
+	// derived state TTL is computed here and has to be checked in its own right.
+	stateTTLMS, err := luaMillis("legacy state TTL in milliseconds", rs.stateTTL(opts))
+	if err != nil {
+		return false, 0, err
+	}
+
 	reply, err := rs.evalScript(limiterID, []interface{}{
 		opts.MaxConcurrent,
-		opts.MinTime.Microseconds(),
+		durationMicros(opts.MinTime),
 		weight,
-		rs.stateTTL(opts).Milliseconds(),
+		stateTTLMS,
 	})
 	if err != nil {
 		return false, 0, err
@@ -208,11 +226,10 @@ func parseRequestReply(reply interface{}) (canRun bool, waitTime time.Duration, 
 	}
 
 	// A negative wait means the refusal has no deadline: capacity is held, and
-	// only another instance releasing it can change the outcome.
-	if waitUS > 0 {
-		waitTime = time.Duration(waitUS) * time.Microsecond
-	}
-	return admitted == 1, waitTime, nil
+	// only another instance releasing it can change the outcome. A positive one
+	// is clamped on conversion, so a nonsense reply cannot wrap into a negative
+	// Duration that the scheduler would read as "no deadline at all".
+	return admitted == 1, microsToDuration(waitUS), nil
 }
 
 // evalScript runs the admission script, falling back to EVAL if Redis has
@@ -248,12 +265,16 @@ func (rs *RedisStore) evalScript(limiterID string, args []interface{}) (interfac
 // must outlast the spacing window: a MinTime longer than the TTL would
 // otherwise be bypassed entirely once the key expired.
 //
+// The doubling saturates rather than wrapping. A MinTime past half the Duration
+// range would otherwise produce a negative TTL, which reads as "shorter than the
+// default" and would leave the window unprotected — the opposite of the intent.
+//
 // This does not fix the underlying flaw — a job that runs longer than the TTL
 // still has its state expire while it is running, which is what tokenized
 // leases address.
 func (rs *RedisStore) stateTTL(opts Options) time.Duration {
 	ttl := defaultStateTTL
-	if minimum := 2 * opts.MinTime; minimum > ttl {
+	if minimum := doubleDuration(opts.MinTime); minimum > ttl {
 		ttl = minimum
 	}
 	return ttl
@@ -281,6 +302,17 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 		return err
 	}
 
+	// This path takes no Options, so Options.Validate never sees the weight. It
+	// still reaches a Lua script, so it is bounded here.
+	luaWeight, err := luaInt("weight", weight)
+	if err != nil {
+		return err
+	}
+	stateTTLMS, err := luaMillis("legacy state TTL in milliseconds", defaultStateTTL)
+	if err != nil {
+		return err
+	}
+
 	rs.mu.RLock()
 	client := rs.client
 	ctx := rs.ctx
@@ -289,11 +321,10 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 		return ErrStoreClosed
 	}
 
-	err := client.Eval(ctx, redisRegisterDoneScript, []string{stateKey(limiterID)},
-		weight,
-		defaultStateTTL.Milliseconds(),
-	).Err()
-	if err != nil {
+	if err := client.Eval(ctx, redisRegisterDoneScript, []string{stateKey(limiterID)},
+		luaWeight,
+		stateTTLMS,
+	).Err(); err != nil {
 		return fmt.Errorf("redis register done error: %w", err)
 	}
 

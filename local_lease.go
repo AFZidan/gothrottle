@@ -65,7 +65,7 @@ func (ls *LocalStore) Acquire(_ context.Context, limiterID string, weight int, o
 // a spacing window with a known end. A concurrency refusal has no deadline: only
 // a release can end it, so retryAfter is zero.
 func (s *localLeaseState) refuse(now time.Time, weight int, opts Options) (retryAfter time.Duration, refused bool) {
-	if opts.MaxConcurrent > 0 && s.runningWeight()+weight > opts.MaxConcurrent {
+	if !fitsWithin(s.runningWeight(), weight, opts.MaxConcurrent) {
 		return 0, true
 	}
 	if opts.MinTime > 0 && !s.lastStart.IsZero() {
@@ -215,11 +215,12 @@ func (s *localLeaseState) purgeExpired(now time.Time) {
 
 // runningWeight is the total weight of live leases. Summing beats a counter
 // here for the same reason as in Redis: it cannot drift away from the
-// reservations it represents.
+// reservations it represents. The sum saturates rather than wrapping, since a
+// negative total would read as free capacity.
 func (s *localLeaseState) runningWeight() int {
 	total := 0
 	for _, lease := range s.leases {
-		total += lease.weight
+		total = addClamped(total, lease.weight)
 	}
 	return total
 }

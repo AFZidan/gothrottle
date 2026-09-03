@@ -49,7 +49,10 @@ func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRu
 
 	now := time.Now()
 
-	if opts.MaxConcurrent > 0 && state.running+weight > opts.MaxConcurrent {
+	// Written as a subtraction against the limit rather than summing first: on a
+	// 32-bit build running+weight can exceed int even when both are individually
+	// valid, and the wrap would turn a refusal into an admission.
+	if !fitsWithin(state.running, weight, opts.MaxConcurrent) {
 		return false, 0, nil
 	}
 
@@ -61,7 +64,7 @@ func (ls *LocalStore) Request(limiterID string, weight int, opts Options) (canRu
 		}
 	}
 
-	state.running += weight
+	state.running = addClamped(state.running, weight)
 	state.lastStart = now
 
 	return true, 0, nil

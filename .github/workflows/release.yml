@@ -1,17 +1,66 @@
 name: Release
 
+# One authoritative release path.
+#
+# The previous design was tag-triggered: pushing a tag ran the tests and then
+# created the release. That inverted the gate. By the time the workflow started
+# the tag already existed and could already be resolved by the Go module proxy,
+# so a failing verification step could not stop a release — only report on one
+# that had already happened. And when the release had also been created by hand,
+# `gh release create` failed on "already exists" and took the dependent Go proxy
+# warm-up down with it. That is exactly how the v1.1.0 run went red.
+#
+# Verification now runs before the tag exists. The tag is created from the
+# verified commit only after every check passes, and the release is created from
+# that tag. Nothing is published while verification could still fail.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version tag to release, e.g. v1.1.1'
+        required: true
+        type: string
+      commit:
+        description: 'Exact commit SHA to release. Defaults to the current tip of main.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Verify only: create no tag and no release.'
+        required: false
+        type: boolean
+        default: false
 
+# Least privilege. Only the job that creates the tag and the release needs write
+# access to repository contents, and it is granted there rather than here.
 permissions:
-  contents: write
+  contents: read
+
+# Two releases must never run at once: both could resolve "the tip of main" to
+# different commits and race to create tags. In-progress runs are not cancelled —
+# a cancelled run could leave a tag with no release — so a second attempt waits.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  release:
-    name: Create Release
+  verify:
+    name: Verify release candidate
     runs-on: ubuntu-latest
+    # Read-only, but wider than the workflow default: a workflow-level
+    # `permissions:` block sets every scope it omits to none, and this job needs
+    # the Actions API (to identify its own check suite), the Checks API and commit
+    # statuses.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      statuses: read
+    outputs:
+      # Only the identity of what is being released crosses to publish. Whether a
+      # tag or release already exists is deliberately not carried: it is a fact
+      # about the moment it was read, and publish re-resolves both.
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
     services:
       redis:
         image: redis:7
@@ -23,56 +72,446 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Full history: proving a commit is an ancestor of main is impossible
+          # in a shallow clone.
+          fetch-depth: 0
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: 1.22
+      - name: Fetch main and tags
+        run: |
+          # Explicit rather than relying on what checkout happens to fetch, since
+          # the ancestry and existing-tag checks below both depend on these refs.
+          git fetch --force origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --tags origin
 
-    - name: Run tests
-      # Releases must not be cut from a tree whose Redis tests never ran.
-      env:
-        REDIS_ADDR: localhost:6379
-        REQUIRE_REDIS: "true"
-      run: go test -v -race ./tests/...
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Canonical Go semantic version, and the module path must be able to
+          # carry its major version. The rules and their tests live in
+          # .github/scripts; a malformed tag is a permanent artifact once pushed.
+          #
+          # The module path is read from go.mod rather than from `go list -m`,
+          # because Go is not set up until later in this job and relying on
+          # whatever version the runner image ships would be incidental.
+          module=$(awk '$1 == "module" {print $2; exit}' go.mod)
+          [ -n "$module" ] || { echo "::error::could not read the module path from go.mod"; exit 1; }
+          .github/scripts/check-version.sh "$VERSION" "$module"
 
-    - name: Create Release Notes
-      run: |
-        echo "## What's Changed" > release_notes.md
-        echo "" >> release_notes.md
-        echo "See the [CHANGELOG.md](CHANGELOG.md) for detailed changes." >> release_notes.md
-        echo "" >> release_notes.md
-        echo "## Installation" >> release_notes.md
-        echo "" >> release_notes.md
-        echo '```bash' >> release_notes.md
-        echo "go get github.com/AFZidan/gothrottle@${{ github.ref_name }}" >> release_notes.md
-        echo '```' >> release_notes.md
+      - name: Resolve and verify commit
+        id: resolve
+        env:
+          VERSION: ${{ inputs.version }}
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
 
-    - name: Create Release
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        gh release create "${{ github.ref_name }}" \
-          --title "Release ${{ github.ref_name }}" \
-          --notes-file release_notes.md
+          if [ -n "$REQUESTED_COMMIT" ]; then
+            if ! sha=$(git rev-list -n 1 "$REQUESTED_COMMIT" 2>/dev/null); then
+              echo "::error::commit '$REQUESTED_COMMIT' does not resolve to a commit in this repository"
+              exit 1
+            fi
+          else
+            sha=$(git rev-list -n 1 refs/remotes/origin/main)
+            echo "No commit supplied; using the current tip of main."
+          fi
 
-  update-go-pkg:
-    name: Update Go Package Registry
+          # A release must be reachable from main. Releasing an unmerged commit
+          # publishes code that no branch protection or review ever gated.
+          if ! git merge-base --is-ancestor "$sha" refs/remotes/origin/main; then
+            echo "::error::commit $sha is not an ancestor of main; only commits merged to main may be released"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "OK: releasing $VERSION from $sha (contained in main)"
+
+      - name: Inspect existing tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # Fail fast on a disagreement, so a doomed release is rejected before
+          # spending several minutes on the test suite. This is not the gate,
+          # though: `publish` re-resolves both the tag and the release, because
+          # either can appear or move in the minutes between the two jobs. Nothing
+          # observed here is carried forward as a job output for that reason — a
+          # boolean recorded now would be a claim about the past.
+          set +e
+          existing=$(.github/scripts/resolve-remote-tag.sh origin "$VERSION")
+          resolve_status=$?
+          set -e
+
+          case "$resolve_status" in
+            0)
+              if [ "$existing" != "$SHA" ]; then
+                echo "::error::tag $VERSION already exists at $existing but $SHA was requested. Refusing to move a published tag; release a new version instead."
+                exit 1
+              fi
+              echo "Tag $VERSION already exists at the requested commit; it will be reused, never moved."
+              ;;
+            1)
+              echo "Tag $VERSION does not exist yet."
+              ;;
+            *)
+              echo "::error::could not determine whether $VERSION exists on origin"
+              exit 1
+              ;;
+          esac
+
+          # An existing release is reported, not treated as a failure: the old
+          # workflow died here on "already exists" and skipped the Go proxy warm-up
+          # that depended on it.
+          if gh release view "$VERSION" --json tagName >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; publish will re-inspect and verify it rather than recreating it."
+          else
+            echo "Release $VERSION does not exist yet."
+          fi
+
+      - name: Require successful CI for the commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # The commit's own CI must have finished successfully. The suite is
+          # re-run below, but that says nothing about lint, the security scan,
+          # CodeQL or the Go 1.19-1.22 matrix, none of which are repeated here.
+          #
+          # The gate is fail-closed: it names the checks it requires and fails if
+          # one is absent. See .github/scripts/classify-checks.sh for the required
+          # set and .github/scripts/test-release-gates.sh for its tests.
+          #
+          # This release run's own check suite is excluded by id: when the release
+          # commit is the tip of main, this very job is in the list as in_progress
+          # and would otherwise block itself.
+          own_suite=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.check_suite_id')
+          .github/scripts/check-required-checks.sh "$SHA" "$own_suite"
+
+      - name: Check out the release commit
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          # Everything below must test the exact commit being released, not
+          # whatever main has moved on to since.
+          git checkout --detach "$SHA"
+          git --no-pager log -1 --oneline
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Verify dependencies
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Verify the module version is declarable
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Re-checked against `go list -m` now that Go is set up, so the module
+          # path comes from the resolved module graph rather than from parsing
+          # go.mod, and the release commit's own go.mod is the one being checked.
+          .github/scripts/check-version.sh "$VERSION" "$(go list -m)"
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "::error::these files are not gofmt -s clean:"
+            gofmt -s -l .
+            exit 1
+          fi
+
+      - name: Wait for Redis
+        shell: bash
+        run: |
+          # The service container is health-checked, but verify the mapped port
+          # answers from the job so a silent Redis failure surfaces here rather
+          # than as a skipped test.
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/localhost/6379) 2>/dev/null; then
+              echo "OK: Redis is reachable on localhost:6379"
+              exit 0
+            fi
+            echo "Waiting for Redis... ($i/30)"
+            sleep 1
+          done
+          echo "::error::Redis did not become reachable at localhost:6379"
+          exit 1
+
+      - name: Run race tests against Redis
+        shell: bash
+        env:
+          REDIS_ADDR: localhost:6379
+          # A release must never be cut from a tree whose Redis tests skipped.
+          REQUIRE_REDIS: 'true'
+        run: go test -v -race ./tests/... 2>&1 | tee release-test-output.txt
+
+      - name: Confirm Redis tests executed
+        shell: bash
+        run: |
+          if grep -qE '^\s*--- SKIP: TestRedis' release-test-output.txt; then
+            echo "::error::Redis integration tests skipped during release verification:"
+            grep -E '^\s*--- SKIP: TestRedis' release-test-output.txt
+            exit 1
+          fi
+          redis_tests=$(grep -cE '^\s*--- PASS: TestRedis' release-test-output.txt || true)
+          if [ "$redis_tests" -lt 1 ]; then
+            echo "::error::no Redis integration test reported PASS; Redis coverage is missing from this release"
+            exit 1
+          fi
+          echo "OK: $redis_tests Redis integration test(s) executed"
+
+      - name: Cross-platform build
+        run: |
+          # CGO_ENABLED=0 explicitly: Go only defaults it to 0 when
+          # cross-compiling if the environment has not already set it.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./...
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build ./...
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...
+
+      - name: Report dry run
+        if: ${{ inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          echo "Dry run complete. $VERSION would have been released from $SHA; no tag and no release were created."
+
+  publish:
+    name: Publish release
     runs-on: ubuntu-latest
-    needs: release
+    needs: verify
+    if: ${{ !inputs.dry_run }}
+    # The only job that writes: it creates the tag and the release.
+    permissions:
+      contents: write
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: 1.22
+      - name: Fetch main and tags
+        run: |
+          # The workflow can be dispatched from any ref, so the commit being
+          # released is not guaranteed to be in the checked-out history.
+          git fetch --force origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --tags origin
 
-    - name: Trigger Go proxy
-      run: |
-        # -x would set a proxy to route through; the intent is a plain GET that
-        # warms the module proxy cache for this tag.
-        curl -fsSL "https://proxy.golang.org/github.com/AFZidan/gothrottle/@v/${{ github.ref_name }}.info"
+      - name: Create the tag
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # The tag state is re-resolved here rather than trusted from `verify`.
+          # The jobs are minutes apart, and in that window someone can create the
+          # tag by hand — at a different commit. Acting on the earlier reading
+          # would publish a release pointing at a tag nobody verified.
+          #
+          # resolve-remote-tag.sh handles both tag kinds and distinguishes "no such
+          # tag" (exit 1) from "cannot tell" (exit 2), because only the first is
+          # safe to treat as "go ahead and create it".
+          set +e
+          existing=$(.github/scripts/resolve-remote-tag.sh origin "$VERSION")
+          resolve_status=$?
+          set -e
+
+          case "$resolve_status" in
+            0)
+              if [ "$existing" != "$SHA" ]; then
+                echo "::error::tag $VERSION now points at $existing but $SHA was verified. Refusing to move a published tag; release a new version instead."
+                exit 1
+              fi
+              echo "Tag $VERSION already exists at the verified commit; leaving it untouched."
+              exit 0
+              ;;
+            1) ;;
+            *)
+              echo "::error::could not determine whether $VERSION exists on origin; refusing to tag"
+              exit 1
+              ;;
+          esac
+
+          # An annotated tag needs a committer identity, and actions/checkout does
+          # not configure one. Set it locally rather than globally so nothing else
+          # in the job inherits it.
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # Never --force: moving a published tag changes what an already-resolved
+          # module version means to every consumer that cached it. A push that
+          # loses a race against a concurrent creation fails here, which is the
+          # right outcome — the next run re-resolves and reports the mismatch.
+          git tag -a "$VERSION" "$SHA" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
+          echo "OK: tagged $SHA as $VERSION"
+
+      - name: Confirm the remote tag resolves to the verified commit
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # The authoritative post-condition, read from origin rather than from the
+          # local clone: whatever happened above, the tag consumers will resolve has
+          # to be the commit that was verified.
+          resolved=$(.github/scripts/resolve-remote-tag.sh origin "$VERSION") || {
+            echo "::error::tag $VERSION is not resolvable on origin after tagging"
+            exit 1
+          }
+          if [ "$resolved" != "$SHA" ]; then
+            echo "::error::tag $VERSION on origin resolves to $resolved, but $SHA was verified"
+            exit 1
+          fi
+          echo "OK: origin's $VERSION resolves to the verified commit $SHA"
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          {
+            echo "## What's Changed"
+            echo
+            echo "See [CHANGELOG.md](CHANGELOG.md) for the detailed list of changes."
+            echo
+            echo "## Installation"
+            echo
+            echo '```bash'
+            echo "go get github.com/AFZidan/gothrottle@${VERSION}"
+            echo '```'
+            echo
+            echo "Released from commit \`${SHA}\`, verified against Redis with the race detector enabled."
+          } > release_notes.md
+
+      - name: Create or inspect the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # Re-inspected here rather than trusting `verify`'s boolean. Between the
+          # two jobs someone can create the release by hand, and acting on the stale
+          # reading means calling `gh release create` for something that already
+          # exists — the exact failure that made the v1.1.0 run red.
+          if release=$(gh release view "$VERSION" --json tagName 2>/dev/null); then
+            tag=$(printf '%s' "$release" | jq -r '.tagName')
+            if [ "$tag" != "$VERSION" ]; then
+              echo "::error::release $VERSION reports tag '$tag'; refusing to proceed against a release whose tag does not match its version"
+              exit 1
+            fi
+
+            # The step above already proved origin's tag resolves to the verified
+            # commit, so a release on that tag is on that commit. Re-resolving here
+            # keeps the two facts in one place: this release, this tag, this commit.
+            resolved=$(.github/scripts/resolve-remote-tag.sh origin "$tag") || {
+              echo "::error::release $VERSION exists but its tag $tag does not resolve on origin"
+              exit 1
+            }
+            if [ "$resolved" != "$SHA" ]; then
+              echo "::error::release $VERSION is on tag $tag, which resolves to $resolved, but $SHA was verified"
+              exit 1
+            fi
+
+            # Idempotent by design: a re-run after a partial failure must reach the
+            # Go proxy warm-up rather than dying on "already exists". The existing
+            # body is left alone, since it may have been edited deliberately.
+            echo "Release $VERSION already exists on the verified commit; inspecting it."
+            gh release view "$VERSION"
+            exit 0
+          fi
+
+          # --target takes a branch or a full commit SHA, so it is the verified SHA
+          # rather than the tag name. The tag already exists at that commit, so this
+          # only names where the release points if the tag were somehow absent.
+          gh release create "$VERSION" \
+            --target "$SHA" \
+            --title "Release $VERSION" \
+            --notes-file release_notes.md
+          echo "OK: created release $VERSION"
+
+  warm-go-proxy:
+    name: Warm the Go module proxy
+    runs-on: ubuntu-latest
+    needs: [verify, publish]
+    if: ${{ !inputs.dry_run }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Fetch the published version through the proxy
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # `go mod download` is the real check, not a hand-built proxy URL. It
+          # applies the module path escaping itself, verifies the checksum against
+          # sum.golang.org, and answers the question that matters — can a consumer
+          # resolve this version — rather than the weaker "does some URL return 200".
+          #
+          # The previous step lowercased the path by hand, and the failure mode was
+          # worse than a 404. proxy.golang.org resolves github.com/afzidan/... to
+          # the same repository, so the request returned 200 and the step passed
+          # while verifying an alias nobody can use: requiring that path fails with
+          # "module declares its path as github.com/AFZidan/gothrottle but was
+          # required as github.com/afzidan/gothrottle". The escaping algorithm
+          # replaces each uppercase letter with !<lowercase>, so the correct escaped
+          # path is github.com/!a!f!zidan/gothrottle — which is exactly the kind of
+          # detail worth delegating to the toolchain instead of reimplementing.
+          module=$(awk '$1 == "module" {print $2; exit}' go.mod)
+          [ -n "$module" ] || { echo "::error::could not read the module path from go.mod"; exit 1; }
+          echo "Requesting ${module}@${VERSION}"
+
+          # A scratch module, so this repository's own go.mod is not modified and
+          # the request cannot be satisfied from the workspace.
+          workdir=$(mktemp -d)
+          cd "$workdir"
+          go mod init proxywarm >/dev/null
+
+          # The proxy fetches asynchronously, so the first attempt can fail while it
+          # works. Retry, then warn rather than fail: the release is already
+          # published and correct at this point, and a slow proxy is not a reason to
+          # report the release as broken.
+          export GOPROXY=https://proxy.golang.org
+          export GOFLAGS=-mod=mod
+          for attempt in $(seq 1 10); do
+            if go mod download "${module}@${VERSION}"; then
+              echo "OK: proxy.golang.org serves ${module}@${VERSION}"
+              go list -m "${module}@${VERSION}"
+              exit 0
+            fi
+            echo "Proxy has not indexed ${module}@${VERSION} yet (attempt ${attempt}/10); retrying in 15s."
+            sleep 15
+          done
+          echo "::warning::proxy.golang.org did not serve ${module}@${VERSION} within the retry window; it usually appears within a few minutes of the first fetch."

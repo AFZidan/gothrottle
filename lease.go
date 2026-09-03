@@ -134,11 +134,16 @@ type leaseConfig struct {
 
 // leaseConfig returns the admission-relevant configuration these options
 // describe.
+//
+// Durations round up to the next microsecond rather than truncating: a
+// sub-microsecond MinTime that truncated to 0 would mean "no spacing", silently
+// discarding the window the caller asked for. Options.Validate has already
+// rejected anything outside Lua's exact range, so no check is needed here.
 func (o Options) leaseConfig() leaseConfig {
 	return leaseConfig{
 		maxConcurrent: int64(o.MaxConcurrent),
-		minTimeUS:     o.MinTime.Microseconds(),
-		leaseTTLUS:    o.leaseTTL().Microseconds(),
+		minTimeUS:     durationMicros(o.MinTime),
+		leaseTTLUS:    durationMicros(o.leaseTTL()),
 	}
 }
 
@@ -189,11 +194,7 @@ const minStateWindow = time.Second
 // Correctness comes from per-lease expiry, so this only has to outlast a lease
 // nobody renews.
 func leaseStateWindow(leaseTTL time.Duration) time.Duration {
-	window := 2 * leaseTTL
-	if window < leaseTTL {
-		// Doubling overflowed; a single TTL still outlasts one lease.
-		window = leaseTTL
-	}
+	window := doubleDuration(leaseTTL)
 	if window < minStateWindow {
 		window = minStateWindow
 	}
@@ -205,10 +206,7 @@ func leaseStateWindow(leaseTTL time.Duration) time.Duration {
 // lease TTL is what previously let a released or renewed lease shorten a long
 // spacing window into oblivion.
 func spacingStateWindow(minTime time.Duration) time.Duration {
-	window := 2 * minTime
-	if window < minTime {
-		window = minTime
-	}
+	window := doubleDuration(minTime)
 	if window < minStateWindow {
 		window = minStateWindow
 	}
