@@ -39,7 +39,7 @@ only behavior changes a caller can observe — both listed under Changed.
   than one job. `SchedStrict` is untouched.
 - **Redis orphan reconciliation uses read-only ZRANGE rank pagination for exact running weight.** The
   running weight is computed by rank pagination over the expiry ZSET with `ZRANGE` (at most 256
-  member names per page) and `HMGET`, avoiding `ZSCAN` duplicate returns under dictionary rehash.
+  expiry-ZSET members per page) and `HMGET`, avoiding `ZSCAN` duplicate returns under dictionary rehash.
   A weight with no expiry entry is never counted, and expiry entries with no weight are removed via
   `ZSCAN`/`HSCAN` (where duplicate returns are harmless for idempotent `ZREM`/`HDEL` operations).
   `last-start`, live leases and the configuration record are not touched.
