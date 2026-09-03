@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-04
+
 Follow-up hardening for issues found auditing `v1.1.0` after it shipped. No API
 was removed or renamed; the changes tighten validation, fix two distributed
 correctness defects and replace the release process. A new sentinel
