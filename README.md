@@ -29,6 +29,99 @@
 - **Configuration Agreement**: Instances sharing a limiter ID must agree on the distributed limits, or the disagreement is reported rather than silently resolved
 - **Easy Integration**: Simple API for wrapping existing functions
 
+## Unreleased
+
+### Fixed
+
+- **Direct datastore calls now enforce `Options.Validate`**. `NewLimiter`
+  validated its options, but `LocalStore.Request`, `LocalStore.Acquire`,
+  `RedisStore.Request` and `RedisStore.Acquire` did not, so a caller using a store
+  directly could pass a negative `MaxConcurrent`, `MinTime` or `LeaseTTL` and get
+  the old silent behavior: the value failed the `> 0` guard in the admission path
+  and every request was admitted. A limiter configured with a miscalculated limit
+  enforced nothing, with no error to say so. All four now run the same validator
+  the limiter does, before any token is generated, any Redis command is issued,
+  any local state is created and any TTL or spacing record is touched.
+- **`SchedBestFit` accounts for capacity held in other processes**. The policy
+  chose a candidate from the limiter's *local* running weight alone. With a shared
+  `MaxConcurrent` of 3, process A holding weight 2, and process B queueing a
+  high-priority weight-2 job ahead of a weight-1 job, B's local weight of 0 said
+  the head job fit; Redis refused it; the scheduler requeued it and ended the
+  pass. The weight-1 job that fitted the real distributed capacity was never
+  attempted, so throughput collapsed to the head job's retry rate. A capacity
+  refusal is now read as information about the store — that weight does not fit,
+  so nothing at least as heavy does either — which lowers a per-pass ceiling and
+  lets strictly lighter queued jobs be considered in the same pass. Refused jobs
+  keep their sequence numbers, so priority and FIFO order are unchanged; a
+  `MinTime` refusal still ends the pass, because spacing gates the limiter rather
+  than one job. `SchedStrict` is untouched.
+- **Redis orphan reconciliation compares membership, not cardinality**. The
+  acquire script only reconciled when `HLEN(leases) ~= ZCARD(expirations)`, which
+  misses equal-cardinality corruption: a lease hash holding token A and an expiry
+  ZSET holding token B are both size 1, so nothing was repaired and token A
+  consumed capacity forever with no expiry entry that could ever release it. The
+  running weight is now summed by walking the expiry ZSET and reading each token's
+  weight, so a weight with no expiry entry is never counted, and expiry entries
+  with no weight are removed. Both collections are walked and deleted in batches,
+  so no `unpack()` can approach Lua's argument limit however much corruption has
+  accumulated. `last-start`, live leases and the configuration record are not
+  touched. See "Orphan reconciliation" in the README for what is and is not
+  guaranteed for an unlimited limiter.
+- **The legacy Redis spacing path clamps a backwards clock**. The lease script
+  already capped a computed wait at `MinTime`; `Request` did not, so a Redis
+  server whose clock stepped backwards reported a wait far longer than the window
+  itself and stalled the caller past the spacing it actually owed.
+- **Arithmetic on state windows and running weight cannot overflow**. `2 *
+  MinTime` — the legacy state TTL and the spacing window — wrapped negative past
+  half the `Duration` range, which compared as "shorter than the default" and left
+  the window unprotected, the opposite of what the doubling is for. Weight sums
+  now saturate instead of wrapping negative, since a negative total reads as free
+  capacity, and capacity comparisons are written as subtraction against the limit
+  so no sum is formed that could exceed `int` on a 32-bit build. Microsecond
+  values arriving from Redis are clamped on conversion, so a nonsense reply cannot
+  become a negative wait that the scheduler reads as "no deadline".
+- **The release workflow gates publication instead of reporting on it**. It was
+  tag-triggered: by the time it ran, the tag existed and the module was already
+  resolvable, so a failing test could not stop a release. It also called
+  `gh release create` unconditionally, which failed with "already exists" when the
+  release had been created by hand — and took the dependent Go proxy warm-up down
+  with it. That is why the historical `v1.1.0` Release run is red. See "Releasing"
+  in the README for the replacement.
+
+### Added
+
+- `ErrValueOutOfRange`, returned when `MaxConcurrent`, a job weight, or `MinTime`
+  or `LeaseTTL` as a microsecond count exceeds 2^53-1. Redis decides admission
+  inside Lua, whose numbers are IEEE-754 doubles, so above that boundary two
+  distinct limits can compare equal and a limit can shift as it crosses it —
+  the limit being enforced would not be the limit that was configured. Rejecting
+  the value is preferred to enforcing it approximately.
+- An `actionlint` job in CI, and `make lint-workflows`, so a mistake in the
+  release workflow surfaces on every push rather than when someone next tries to
+  cut a release.
+- Regression tests for each of the above: `tests/store_validation_test.go`
+  (direct-call validation, numeric boundaries), `tests/bestfit_test.go`
+  (distributed best fit, including two limiters over two Redis stores) and
+  `tests/redis_orphan_test.go` (every shape of orphan corruption, bounded repair,
+  and a command-count assertion that a healthy limiter does not scan the lease
+  hash).
+
+### Changed
+
+- **Direct datastore calls reject invalid options rather than proceeding**. This
+  is the intended fix above, but it is a behavior change for code that called
+  `Request` or `Acquire` directly with options a limiter would have rejected: such
+  a call now returns the corresponding sentinel instead of admitting the job.
+  Every sentinel and `errors.Is` relationship is unchanged.
+
+  The validator is `Options.Validate` in full, including the scheduler-only fields
+  (`SchedPolicy`, `RetryInterval`, `MaxQueueSize`) that no store reads. A negative
+  `RetryInterval` is a configuration mistake wherever it appears, and one
+  validator with one behavior is worth more than a store-specific subset where
+  which mistakes are caught depends on the entry point used.
+- **The release workflow is `workflow_dispatch` only**. Pushing a tag no longer
+  triggers a release. See "Releasing" in the README.
+
 ## Installation
 
 ```bash

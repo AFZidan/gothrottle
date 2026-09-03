@@ -134,11 +134,16 @@ type leaseConfig struct {
 
 // leaseConfig returns the admission-relevant configuration these options
 // describe.
+//
+// Durations round up to the next microsecond rather than truncating: a
+// sub-microsecond MinTime that truncated to 0 would mean "no spacing", silently
+// discarding the window the caller asked for. Options.Validate has already
+// rejected anything outside Lua's exact range, so no check is needed here.
 func (o Options) leaseConfig() leaseConfig {
 	return leaseConfig{
 		maxConcurrent: int64(o.MaxConcurrent),
-		minTimeUS:     o.MinTime.Microseconds(),
-		leaseTTLUS:    o.leaseTTL().Microseconds(),
+		minTimeUS:     durationMicros(o.MinTime),
+		leaseTTLUS:    durationMicros(o.leaseTTL()),
 	}
 }
 

@@ -56,9 +56,11 @@ jobs:
       checks: read
       statuses: read
     outputs:
+      # Only the identity of what is being released crosses to publish. Whether a
+      # tag or release already exists is deliberately not carried: it is a fact
+      # about the moment it was read, and publish re-resolves both.
       version: ${{ steps.resolve.outputs.version }}
       sha: ${{ steps.resolve.outputs.sha }}
-      release_exists: ${{ steps.existing.outputs.release_exists }}
     services:
       redis:
         image: redis:7
@@ -88,14 +90,17 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          # Strict semver with a leading v, optional pre-release and build
-          # metadata. Go module versions must carry the v, and a malformed tag is
-          # a permanent artifact once pushed.
-          if ! printf '%s' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
-            echo "::error::version '$VERSION' is not a valid semantic version tag (expected vMAJOR.MINOR.PATCH)"
-            exit 1
-          fi
-          echo "OK: $VERSION is a valid semantic version tag"
+          set -euo pipefail
+          # Canonical Go semantic version, and the module path must be able to
+          # carry its major version. The rules and their tests live in
+          # .github/scripts; a malformed tag is a permanent artifact once pushed.
+          #
+          # The module path is read from go.mod rather than from `go list -m`,
+          # because Go is not set up until later in this job and relying on
+          # whatever version the runner image ships would be incidental.
+          module=$(awk '$1 == "module" {print $2; exit}' go.mod)
+          [ -n "$module" ] || { echo "::error::could not read the module path from go.mod"; exit 1; }
+          .github/scripts/check-version.sh "$VERSION" "$module"
 
       - name: Resolve and verify commit
         id: resolve
@@ -127,7 +132,6 @@ jobs:
           echo "OK: releasing $VERSION from $sha (contained in main)"
 
       - name: Inspect existing tag and release
-        id: existing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.resolve.outputs.version }}
@@ -135,28 +139,42 @@ jobs:
         run: |
           set -euo pipefail
 
-          # An existing tag is acceptable only if it already points at the commit
-          # being released — the re-run case. Pointing elsewhere means the request
-          # disagrees with published history, and moving the tag would silently
-          # change what `go get` at that version resolves to. That is an error,
-          # not something to reconcile.
-          if tagged=$(git rev-list -n 1 "refs/tags/$VERSION" 2>/dev/null); then
-            if [ "$tagged" != "$SHA" ]; then
-              echo "::error::tag $VERSION already exists at $tagged but $SHA was requested. Refusing to move a published tag; release a new version instead."
+          # Fail fast on a disagreement, so a doomed release is rejected before
+          # spending several minutes on the test suite. This is not the gate,
+          # though: `publish` re-resolves both the tag and the release, because
+          # either can appear or move in the minutes between the two jobs. Nothing
+          # observed here is carried forward as a job output for that reason — a
+          # boolean recorded now would be a claim about the past.
+          set +e
+          existing=$(.github/scripts/resolve-remote-tag.sh origin "$VERSION")
+          resolve_status=$?
+          set -e
+
+          case "$resolve_status" in
+            0)
+              if [ "$existing" != "$SHA" ]; then
+                echo "::error::tag $VERSION already exists at $existing but $SHA was requested. Refusing to move a published tag; release a new version instead."
+                exit 1
+              fi
+              echo "Tag $VERSION already exists at the requested commit; it will be reused, never moved."
+              ;;
+            1)
+              echo "Tag $VERSION does not exist yet."
+              ;;
+            *)
+              echo "::error::could not determine whether $VERSION exists on origin"
               exit 1
-            fi
-            echo "Tag $VERSION already exists at the requested commit; it will be reused, never moved."
-          fi
+              ;;
+          esac
 
           # An existing release is reported, not treated as a failure: the old
-          # workflow died here on "already exists" and skipped the Go proxy
-          # warm-up that depended on it.
-          release_exists=false
+          # workflow died here on "already exists" and skipped the Go proxy warm-up
+          # that depended on it.
           if gh release view "$VERSION" --json tagName >/dev/null 2>&1; then
-            release_exists=true
-            echo "Release $VERSION already exists; it will be inspected rather than recreated."
+            echo "Release $VERSION already exists; publish will re-inspect and verify it rather than recreating it."
+          else
+            echo "Release $VERSION does not exist yet."
           fi
-          echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
 
       - name: Require successful CI for the commit
         env:
@@ -169,38 +187,15 @@ jobs:
           # re-run below, but that says nothing about lint, the security scan,
           # CodeQL or the Go 1.19-1.22 matrix, none of which are repeated here.
           #
-          # This release run's own check runs are excluded by check-suite id:
-          # when the release commit is the tip of main, this very job appears in
-          # the list as in_progress and would otherwise block itself.
+          # The gate is fail-closed: it names the checks it requires and fails if
+          # one is absent. See .github/scripts/classify-checks.sh for the required
+          # set and .github/scripts/test-release-gates.sh for its tests.
+          #
+          # This release run's own check suite is excluded by id: when the release
+          # commit is the tip of main, this very job is in the list as in_progress
+          # and would otherwise block itself.
           own_suite=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.check_suite_id')
-          checks=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
-            --jq '.check_runs[] | [(.check_suite.id | tostring), .name, .status, (.conclusion // "pending")] | @tsv')
-
-          others=$(printf '%s\n' "$checks" | awk -F'\t' -v own="$own_suite" 'NF && $1 != own')
-          if [ -z "$others" ]; then
-            echo "::error::no CI check runs found for $SHA; CI must run on a commit before it is released"
-            exit 1
-          fi
-
-          printf '%s\n' "$others" | awk -F'\t' '{printf "  %s: %s/%s\n", $2, $3, $4}'
-          unhealthy=$(printf '%s\n' "$others" | awk -F'\t' '$3 != "completed" || ($4 != "success" && $4 != "neutral" && $4 != "skipped")')
-          if [ -n "$unhealthy" ]; then
-            echo "::error::commit $SHA has check runs that are not successful:"
-            printf '%s\n' "$unhealthy" | awk -F'\t' '{printf "  %s: %s/%s\n", $2, $3, $4}'
-            exit 1
-          fi
-
-          # Commit statuses are a separate mechanism from check runs; some tools
-          # (coverage reporters, for example) still use them.
-          status_state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" --jq '"\(.state) \(.total_count)"')
-          echo "  combined commit status: $status_state"
-          case "$status_state" in
-            failure*|error*)
-              echo "::error::commit $SHA has a failing commit status"
-              exit 1
-              ;;
-          esac
-          echo "OK: every check run for $SHA is successful"
+          .github/scripts/check-required-checks.sh "$SHA" "$own_suite"
 
       - name: Check out the release commit
         env:
@@ -227,27 +222,10 @@ jobs:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          # A v2+ tag needs a matching module path suffix. Publishing v2.0.0 from
-          # a module declared as v1 yields a version the proxy serves but `go get`
-          # cannot resolve.
-          module=$(go list -m)
-          major=${VERSION%%.*}
-          major=${major#v}
-          case "$major" in
-            0|1)
-              if printf '%s' "$module" | grep -Eq '/v[0-9]+$'; then
-                echo "::error::module path $module carries a major-version suffix but $VERSION is v$major"
-                exit 1
-              fi
-              ;;
-            *)
-              if [ "${module##*/}" != "v$major" ]; then
-                echo "::error::releasing $VERSION requires the module path to end in /v$major, but it is $module"
-                exit 1
-              fi
-              ;;
-          esac
-          echo "OK: module $module can be released as $VERSION"
+          # Re-checked against `go list -m` now that Go is set up, so the module
+          # path comes from the resolved module graph rather than from parsing
+          # go.mod, and the release commit's own go.mod is the one being checked.
+          .github/scripts/check-version.sh "$VERSION" "$(go list -m)"
 
       - name: Run go vet
         run: go vet ./...
@@ -346,18 +324,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Verification already proved any existing tag points at this commit,
-          # so this is either the first push or a no-op re-run. Never --force:
-          # moving a published tag changes what an already-resolved module
-          # version means to every consumer that cached it.
+          # The tag state is re-resolved here rather than trusted from `verify`.
+          # The jobs are minutes apart, and in that window someone can create the
+          # tag by hand — at a different commit. Acting on the earlier reading
+          # would publish a release pointing at a tag nobody verified.
           #
-          # ls-remote also returns the peeled `^{}` ref for an annotated tag, so
-          # only the first line is of interest.
-          existing=$(git ls-remote --tags origin "refs/tags/$VERSION" | awk 'NR==1 {print $1}')
-          if [ -n "$existing" ]; then
-            echo "Tag $VERSION is already on origin at $existing; leaving it untouched."
-            exit 0
-          fi
+          # resolve-remote-tag.sh handles both tag kinds and distinguishes "no such
+          # tag" (exit 1) from "cannot tell" (exit 2), because only the first is
+          # safe to treat as "go ahead and create it".
+          set +e
+          existing=$(.github/scripts/resolve-remote-tag.sh origin "$VERSION")
+          resolve_status=$?
+          set -e
+
+          case "$resolve_status" in
+            0)
+              if [ "$existing" != "$SHA" ]; then
+                echo "::error::tag $VERSION now points at $existing but $SHA was verified. Refusing to move a published tag; release a new version instead."
+                exit 1
+              fi
+              echo "Tag $VERSION already exists at the verified commit; leaving it untouched."
+              exit 0
+              ;;
+            1) ;;
+            *)
+              echo "::error::could not determine whether $VERSION exists on origin; refusing to tag"
+              exit 1
+              ;;
+          esac
 
           # An annotated tag needs a committer identity, and actions/checkout does
           # not configure one. Set it locally rather than globally so nothing else
@@ -365,9 +359,33 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
+          # Never --force: moving a published tag changes what an already-resolved
+          # module version means to every consumer that cached it. A push that
+          # loses a race against a concurrent creation fails here, which is the
+          # right outcome — the next run re-resolves and reports the mismatch.
           git tag -a "$VERSION" "$SHA" -m "Release $VERSION"
           git push origin "refs/tags/$VERSION"
           echo "OK: tagged $SHA as $VERSION"
+
+      - name: Confirm the remote tag resolves to the verified commit
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # The authoritative post-condition, read from origin rather than from the
+          # local clone: whatever happened above, the tag consumers will resolve has
+          # to be the commit that was verified.
+          resolved=$(.github/scripts/resolve-remote-tag.sh origin "$VERSION") || {
+            echo "::error::tag $VERSION is not resolvable on origin after tagging"
+            exit 1
+          }
+          if [ "$resolved" != "$SHA" ]; then
+            echo "::error::tag $VERSION on origin resolves to $resolved, but $SHA was verified"
+            exit 1
+          fi
+          echo "OK: origin's $VERSION resolves to the verified commit $SHA"
 
       - name: Build release notes
         env:
@@ -393,24 +411,43 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.verify.outputs.version }}
           SHA: ${{ needs.verify.outputs.sha }}
-          RELEASE_EXISTS: ${{ needs.verify.outputs.release_exists }}
         run: |
           set -euo pipefail
 
-          if [ "$RELEASE_EXISTS" = 'true' ]; then
-            # Idempotent by design: a re-run after a partial failure must reach
-            # the Go proxy warm-up rather than dying on "already exists". The
-            # existing body is left alone, since it may have been edited
-            # deliberately.
-            echo "Release $VERSION already exists; inspecting it."
+          # Re-inspected here rather than trusting `verify`'s boolean. Between the
+          # two jobs someone can create the release by hand, and acting on the stale
+          # reading means calling `gh release create` for something that already
+          # exists — the exact failure that made the v1.1.0 run red.
+          if release=$(gh release view "$VERSION" --json tagName 2>/dev/null); then
+            tag=$(printf '%s' "$release" | jq -r '.tagName')
+            if [ "$tag" != "$VERSION" ]; then
+              echo "::error::release $VERSION reports tag '$tag'; refusing to proceed against a release whose tag does not match its version"
+              exit 1
+            fi
+
+            # The step above already proved origin's tag resolves to the verified
+            # commit, so a release on that tag is on that commit. Re-resolving here
+            # keeps the two facts in one place: this release, this tag, this commit.
+            resolved=$(.github/scripts/resolve-remote-tag.sh origin "$tag") || {
+              echo "::error::release $VERSION exists but its tag $tag does not resolve on origin"
+              exit 1
+            }
+            if [ "$resolved" != "$SHA" ]; then
+              echo "::error::release $VERSION is on tag $tag, which resolves to $resolved, but $SHA was verified"
+              exit 1
+            fi
+
+            # Idempotent by design: a re-run after a partial failure must reach the
+            # Go proxy warm-up rather than dying on "already exists". The existing
+            # body is left alone, since it may have been edited deliberately.
+            echo "Release $VERSION already exists on the verified commit; inspecting it."
             gh release view "$VERSION"
             exit 0
           fi
 
-          # --target takes a branch or a full commit SHA, so it is the verified
-          # SHA rather than the tag name. The tag already exists at that commit,
-          # so this only names where the release points if the tag were somehow
-          # absent.
+          # --target takes a branch or a full commit SHA, so it is the verified SHA
+          # rather than the tag name. The tag already exists at that commit, so this
+          # only names where the release points if the tag were somehow absent.
           gh release create "$VERSION" \
             --target "$SHA" \
             --title "Release $VERSION" \
@@ -423,27 +460,58 @@ jobs:
     needs: [verify, publish]
     if: ${{ !inputs.dry_run }}
     steps:
-      - name: Request the module version
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Fetch the published version through the proxy
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          # A plain GET is what populates the proxy cache. `curl -x` sets a proxy
-          # to route *through*, which is what this step used to do by mistake.
+
+          # `go mod download` is the real check, not a hand-built proxy URL. It
+          # applies the module path escaping itself, verifies the checksum against
+          # sum.golang.org, and answers the question that matters — can a consumer
+          # resolve this version — rather than the weaker "does some URL return 200".
           #
-          # The module path is lowercased because the proxy escapes uppercase
-          # letters as !<letter>; requesting the mixed-case path 404s forever.
-          #
-          # The proxy fetches asynchronously, so the first request can 404 while
-          # it works. Retry before treating that as a problem, and warn rather
-          # than fail: the release itself is already published and correct.
+          # The previous step lowercased the path by hand, and the failure mode was
+          # worse than a 404. proxy.golang.org resolves github.com/afzidan/... to
+          # the same repository, so the request returned 200 and the step passed
+          # while verifying an alias nobody can use: requiring that path fails with
+          # "module declares its path as github.com/AFZidan/gothrottle but was
+          # required as github.com/afzidan/gothrottle". The escaping algorithm
+          # replaces each uppercase letter with !<lowercase>, so the correct escaped
+          # path is github.com/!a!f!zidan/gothrottle — which is exactly the kind of
+          # detail worth delegating to the toolchain instead of reimplementing.
+          module=$(awk '$1 == "module" {print $2; exit}' go.mod)
+          [ -n "$module" ] || { echo "::error::could not read the module path from go.mod"; exit 1; }
+          echo "Requesting ${module}@${VERSION}"
+
+          # A scratch module, so this repository's own go.mod is not modified and
+          # the request cannot be satisfied from the workspace.
+          workdir=$(mktemp -d)
+          cd "$workdir"
+          go mod init proxywarm >/dev/null
+
+          # The proxy fetches asynchronously, so the first attempt can fail while it
+          # works. Retry, then warn rather than fail: the release is already
+          # published and correct at this point, and a slow proxy is not a reason to
+          # report the release as broken.
+          export GOPROXY=https://proxy.golang.org
+          export GOFLAGS=-mod=mod
           for attempt in $(seq 1 10); do
-            if curl -fsSL "https://proxy.golang.org/github.com/afzidan/gothrottle/@v/${VERSION}.info"; then
-              echo
-              echo "OK: proxy.golang.org serves ${VERSION}"
+            if go mod download "${module}@${VERSION}"; then
+              echo "OK: proxy.golang.org serves ${module}@${VERSION}"
+              go list -m "${module}@${VERSION}"
               exit 0
             fi
-            echo "Proxy has not indexed ${VERSION} yet (attempt ${attempt}/10); retrying in 15s."
+            echo "Proxy has not indexed ${module}@${VERSION} yet (attempt ${attempt}/10); retrying in 15s."
             sleep 15
           done
-          echo "::warning::proxy.golang.org did not serve ${VERSION} within the retry window; it usually appears within a few minutes of the first fetch."
+          echo "::warning::proxy.golang.org did not serve ${module}@${VERSION} within the retry window; it usually appears within a few minutes of the first fetch."

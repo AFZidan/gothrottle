@@ -110,7 +110,11 @@ for i = 1, #state, 2 do
     end
 end
 
-if max_concurrent > 0 and running + weight > max_concurrent then
+-- Subtraction rather than "running + weight > max_concurrent": both operands are
+-- individually within Lua's exact range, but their sum need not be, and a sum that
+-- rounds turns a refusal into an admission. max_concurrent - running is bounded by
+-- max_concurrent, so it stays exact. Matches the lease script and the Go side.
+if max_concurrent > 0 and (running >= max_concurrent or weight > max_concurrent - running) then
     return {0, -1}
 end
 
@@ -184,11 +188,18 @@ func (rs *RedisStore) Request(limiterID string, weight int, opts Options) (canRu
 		return false, 0, err
 	}
 
+	// Validation has already bounded MaxConcurrent, weight and MinTime, but the
+	// derived state TTL is computed here and has to be checked in its own right.
+	stateTTLMS, err := luaMillis("legacy state TTL in milliseconds", rs.stateTTL(opts))
+	if err != nil {
+		return false, 0, err
+	}
+
 	reply, err := rs.evalScript(limiterID, []interface{}{
 		opts.MaxConcurrent,
-		opts.MinTime.Microseconds(),
+		durationMicros(opts.MinTime),
 		weight,
-		rs.stateTTL(opts).Milliseconds(),
+		stateTTLMS,
 	})
 	if err != nil {
 		return false, 0, err
@@ -291,6 +302,17 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 		return err
 	}
 
+	// This path takes no Options, so Options.Validate never sees the weight. It
+	// still reaches a Lua script, so it is bounded here.
+	luaWeight, err := luaInt("weight", weight)
+	if err != nil {
+		return err
+	}
+	stateTTLMS, err := luaMillis("legacy state TTL in milliseconds", defaultStateTTL)
+	if err != nil {
+		return err
+	}
+
 	rs.mu.RLock()
 	client := rs.client
 	ctx := rs.ctx
@@ -299,11 +321,10 @@ func (rs *RedisStore) RegisterDone(limiterID string, weight int) error {
 		return ErrStoreClosed
 	}
 
-	err := client.Eval(ctx, redisRegisterDoneScript, []string{stateKey(limiterID)},
-		weight,
-		defaultStateTTL.Milliseconds(),
-	).Err()
-	if err != nil {
+	if err := client.Eval(ctx, redisRegisterDoneScript, []string{stateKey(limiterID)},
+		luaWeight,
+		stateTTLMS,
+	).Err(); err != nil {
 		return fmt.Errorf("redis register done error: %w", err)
 	}
 

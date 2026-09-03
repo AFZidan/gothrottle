@@ -132,7 +132,7 @@ func (o Options) Validate() error {
 	if o.MinTime < 0 {
 		return ErrInvalidMinTime
 	}
-	if err := checkLuaExactRange("MinTime in microseconds", o.MinTime.Microseconds()); err != nil {
+	if err := checkLuaExactRange("MinTime in microseconds", durationMicros(o.MinTime)); err != nil {
 		return err
 	}
 	if o.MaxQueueSize < 0 {
@@ -144,7 +144,7 @@ func (o Options) Validate() error {
 	if o.LeaseTTL < 0 {
 		return ErrInvalidLeaseTTL
 	}
-	if err := checkLuaExactRange("LeaseTTL in microseconds", o.LeaseTTL.Microseconds()); err != nil {
+	if err := checkLuaExactRange("LeaseTTL in microseconds", durationMicros(o.LeaseTTL)); err != nil {
 		return err
 	}
 	switch o.SchedPolicy {
