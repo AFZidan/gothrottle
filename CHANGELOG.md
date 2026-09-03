@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.1] - 2026-09-02
-
 Follow-up hardening for issues found auditing `v1.1.0` after it shipped. No API
 was removed or renamed; the changes tighten validation, fix two distributed
 correctness defects and replace the release process. A new sentinel
@@ -39,18 +37,12 @@ only behavior changes a caller can observe — both listed under Changed.
   keep their sequence numbers, so priority and FIFO order are unchanged; a
   `MinTime` refusal still ends the pass, because spacing gates the limiter rather
   than one job. `SchedStrict` is untouched.
-- **Redis orphan reconciliation compares membership, not cardinality.** The
-  acquire script only reconciled when `HLEN(leases) ~= ZCARD(expirations)`, which
-  misses equal-cardinality corruption: a lease hash holding token A and an expiry
-  ZSET holding token B are both size 1, so nothing was repaired and token A
-  consumed capacity forever with no expiry entry that could ever release it. The
-  running weight is now summed by walking the expiry ZSET and reading each token's
-  weight, so a weight with no expiry entry is never counted, and expiry entries
-  with no weight are removed. Both collections are walked and deleted in batches,
-  so no `unpack()` can approach Lua's argument limit however much corruption has
-  accumulated. `last-start`, live leases and the configuration record are not
-  touched. See "Orphan reconciliation" in the README for what is and is not
-  guaranteed for an unlimited limiter.
+- **Redis orphan reconciliation uses read-only ZRANGE rank pagination for exact running weight.** The
+  running weight is computed by rank pagination over the expiry ZSET with `ZRANGE` (at most 256
+  member names per page) and `HMGET`, avoiding `ZSCAN` duplicate returns under dictionary rehash.
+  A weight with no expiry entry is never counted, and expiry entries with no weight are removed via
+  `ZSCAN`/`HSCAN` (where duplicate returns are harmless for idempotent `ZREM`/`HDEL` operations).
+  `last-start`, live leases and the configuration record are not touched.
 - **The legacy Redis spacing path clamps a backwards clock.** The lease script
   already capped a computed wait at `MinTime`; `Request` did not, so a Redis
   server whose clock stepped backwards reported a wait far longer than the window
@@ -105,8 +97,6 @@ only behavior changes a caller can observe — both listed under Changed.
   which mistakes are caught depends on the entry point used.
 - **The release workflow is `workflow_dispatch` only.** Pushing a tag no longer
   triggers a release. See "Releasing" in the README.
-
-## [1.1.0] - 2026-09-02
 
 ## [1.1.0] - 2026-09-02
 
